@@ -15,7 +15,7 @@ local function tocVersion()
 end
 GL.version = tocVersion() or "0.0.0"
 -- One line for the "updated to" message at the first login after an update (an addon cannot read CHANGELOG.md).
-GL.whatsNew = "pick the trial and newcomer ranks by name in Settings, a DING! line for level-ups, a secure Invite button"
+GL.whatsNew = "bans and leaves save again, the Log follows the game's guild log (its duplicates no longer pile up, offline joins and leaves get the game's time), notes are read-only with Edit in roster"
 
 -- "1.2.10" -> 1002010, so versions compare as numbers; nil when the text is not a version.
 function GL:VersionNumber(text)
@@ -32,6 +32,7 @@ GL.prefix = "|TInterface\\AddOns\\Tabard\\logo:14:14:0:0|t |cffffd100Tabard:|r "
 GL.KINDS = {
     join = { order = 1, label = "Joined", color = "ff33dd33" },
     rejoin = { order = 2, label = "Rejoined", color = "ff33dd33" },
+    invite = { order = 2.5, label = "Invited", color = "ff8fcf8f" },
     leave = { order = 3, label = "Left", color = "ffff5555" },
     kick = { order = 4, label = "Removed", color = "ffff5555" },
     promote = { order = 5, label = "Promoted", color = "ffffd100" },
@@ -66,7 +67,6 @@ local DEFAULT_SETTINGS = {
     announce = { join = true, rejoin = true, leave = true, kick = true, promote = true, demote = true, level = true, note = false, onote = false,
         custom = false, rename = true, back = true, alt = false, main = false, ban = true, unban = true, nick = false,
         online = true },  -- online is not an event kind: a line when a guild member logs in, nothing is recorded
-    showFilters = {},        -- kind -> false hides it in the log; absent/true shows it
     inactiveDays = 30,       -- "back after a break" threshold
     kickDays = 60,           -- recommend removing members offline this long
     kickMaxLevel = 0,        -- only recommend removal below this level (0 = any level)
@@ -103,14 +103,16 @@ end
 -- TabardDB = { version, settings, guilds = { [key] = guild } }
 -- guild = {
 --   name, realm, created (first scan), scans (count), seeded, lastScan,
---   members = { [name] = member }, former = { [name] = member }, events = { event, ... }, seen = { [fingerprint] = t },
+--   members = { [name] = member }, former = { [name] = member }, events = { event, ... }, seen = { ["kind|p1|p2|rank"] = { t, ... } },
 --   groups = { [id] = { main = name, alts = { name, ... }, t } }, nextGroup,
---   bans = { [name] = { t, by, reason, class, guid, stamp } }, ranks = { [index] = name }, peers = { [name] = { version, t } }
+--   bans = { [name] = { t, by, reason, class, guid, stamp } }, ranks = { [index] = name }, peers = { [name] = { version, t } },
+--   pendingLeave = { [name] = { t, kind, by, at } } (a game-log leave read while the person still counted as a member)
 -- }
 -- member = { name, class, level, rank, rankIndex, note, onote, guid, firstSeen, lastSeen, lastOnline, online, missing,
 --   joined, joinedSource, invitedBy, promoted, promotedSource, group, custom, customBy, birthday = { m, d },
 --   safe = { kick, promote }, stamps = { field = when it was last set, for syncing }, left, leftKind }
--- event = { t, k, who, by, from, to, level, text, src, id }
+-- event = { t, k, who, by, from, to, level, text, src, id, g (claimed by a game-log entry),
+--   late (a join or leave the roster saw late: the earliest it could have happened, until the game's log dates it) }
 function GL:InitDB()
     if type(TabardDB) ~= "table" and type(GuildLedgerDB) == "table" then TabardDB = GuildLedgerDB end   -- migrated from GuildLedger
     if type(TabardDB) ~= "table" then TabardDB = {} end
@@ -121,8 +123,46 @@ function GL:InitDB()
     copyDefaults(db.settings, DEFAULT_SETTINGS)
     -- Level-ups in chat became the default in 1.0.0; settings saved before that had it off.
     if not db.levelLinesOn then db.levelLinesOn = true db.settings.announce.level = true end
+    -- Kinds the Log hides on every visit (Settings). Seeded from the old saved filter, else Leveled only.
+    if type(db.settings.logHidden) ~= "table" then
+        local hidden, any = {}, false
+        if type(db.settings.showFilters) == "table" then
+            for kind, shown in pairs(db.settings.showFilters) do if shown == false then hidden[kind] = true any = true end end
+        end
+        if not any then hidden = { level = true } end
+        db.settings.logHidden = hidden
+    end
+    db.settings.showFilters = nil
+    db.settings.noteJoinDate = nil   -- removed: the game blocks addons from writing guild notes
     self.db = db
     self.settings = db.settings
+end
+
+-- Log filter: GL.logFilter is kind -> false for hidden kinds, for this visit only.
+function GL:ResetLogFilter()
+    self.logFilter = {}
+    local hidden = self.settings and self.settings.logHidden or {}
+    for kind, isHidden in pairs(hidden) do if isHidden then self.logFilter[kind] = false end end
+end
+
+function GL:LogKindShown(kind)
+    if not self.logFilter then self:ResetLogFilter() end
+    return self.logFilter[kind] ~= false
+end
+
+function GL:SetLogKindShown(kind, shown)
+    if not self.logFilter then self:ResetLogFilter() end
+    if shown then self.logFilter[kind] = nil else self.logFilter[kind] = false end
+end
+
+-- Shows only the given kinds (kind -> true); an empty or nil set shows everything.
+function GL:SetLogFilterOnly(kinds)
+    self.logFilter = {}
+    if not kinds then return end
+    local any = false
+    for _, kind in ipairs(self.KIND_ORDER) do if kinds[kind] then any = true end end
+    if not any then return end
+    for _, kind in ipairs(self.KIND_ORDER) do if not kinds[kind] then self.logFilter[kind] = false end end
 end
 
 function GL:GuildKey()
@@ -145,7 +185,41 @@ function GL:Guild()
     for _, field in ipairs({ "members", "former", "events", "seen", "groups", "bans", "ranks", "peers" }) do
         if type(guild[field]) ~= "table" then guild[field] = {} end
     end
+    self:UpgradeSeen(guild)
     return guild
+end
+
+-- Converts old game-log fingerprints ("kind|p1|p2|rank|hour" = time) to the current form
+-- ("kind|p1|p2|rank" = { time, ... }, ascending). Times of one entry less than an hour apart were the same
+-- entry read in two hour buckets and are merged; times further apart are kept. Safe to run repeatedly.
+function GL:UpgradeSeen(guild)
+    local seen = guild.seen
+    local converted
+    for key, value in pairs(seen) do
+        if type(value) == "number" then
+            converted = converted or {}
+            local newKey = key:match("^(.*)|[^|]*$")
+            if newKey then
+                converted[newKey] = converted[newKey] or {}
+                table.insert(converted[newKey], value)
+            end
+            seen[key] = nil
+        elseif type(value) ~= "table" then
+            seen[key] = nil
+        end
+    end
+    if not converted then return end
+    for key, times in pairs(converted) do
+        table.sort(times)
+        local merged = {}
+        for _, t in ipairs(times) do
+            if #merged == 0 or t - merged[#merged] >= 3600 then merged[#merged + 1] = t end
+        end
+        local list = seen[key] or {}
+        for _, t in ipairs(merged) do list[#list + 1] = t end
+        table.sort(list)
+        seen[key] = list
+    end
 end
 
 function GL:Member(guild, name)
@@ -175,21 +249,27 @@ function GL:ShortName(name)
     return name
 end
 
--- The player's name as the guild roster writes it. On Forever, UnitName("player") returns the first name and the
--- surname as two values ("Zev", "Zev") while the roster says "Zev Zev"; other clients return name and realm.
-function GL:PlayerName()
-    local full = GetUnitName and GetUnitName("player", false)
-    if type(full) == "string" and string.find(full, " ", 1, true) and not (issecretvalue and issecretvalue(full)) then
+-- A unit's name as the guild roster writes it ("Ooh Woo"), or nil when the name is missing or secret. On Forever,
+-- UnitName returns the first name and the surname as two values ("Ooh", "Woo") while the roster says "Ooh Woo";
+-- other clients return name and realm, or a full name with a realm, which the realm part is stripped from.
+function GL:UnitRosterName(unit)
+    local full = GetUnitName and GetUnitName(unit, false)
+    if type(full) == "string" and self:IsUsable(full) and string.find(full, " ", 1, true) then
         return self:ShortName(full)
     end
-    local name, second = UnitName("player")
-    if type(name) ~= "string" then return "?" end
+    local name, second = UnitName(unit)
+    if not (self:IsUsable(name) and type(name) == "string") then return nil end
     name = self:ShortName(name)
-    if type(second) == "string" and second ~= "" and not string.find(second, "-", 1, true) then
+    if self:IsUsable(second) and type(second) == "string" and second ~= "" and not string.find(second, "-", 1, true) then
         local realm = string.gsub(GetRealmName() or "", "%s+", "")
         if string.gsub(second, "%s+", "") ~= realm then name = name .. " " .. second end
     end
     return name
+end
+
+-- The player's name as the guild roster writes it ("Zev Zev"), or "?" when the client gives none.
+function GL:PlayerName()
+    return self:UnitRosterName("player") or "?"
 end
 
 -- Just the first name ("Zev"), for lines written in the first person.
@@ -279,6 +359,21 @@ end
 function GL:FormatDate(t)
     if type(t) ~= "number" or t <= 0 then return "" end
     return date("%d %b %Y", t)
+end
+
+-- "Recording since 10 Nov 2026, keeping 365 days": where the Log's history starts and how long it is kept.
+-- Earliest is the smaller of the ledger's creation and its first event. nil when there is no ledger.
+function GL:RecordingSinceText(guild)
+    guild = guild or self:Guild()
+    if not guild then return nil end
+    local earliest = guild.created
+    local first = guild.events and guild.events[1]
+    if first and type(first.t) == "number" and (type(earliest) ~= "number" or first.t < earliest) then earliest = first.t end
+    if type(earliest) ~= "number" then return nil end
+    local keep = self.settings and self.settings.keepEventDays
+    if keep == nil then keep = 365 end
+    local keeping = keep == 0 and "keeping everything" or ("keeping " .. keep .. " days")
+    return "Recording since " .. self:FormatDate(earliest) .. ", " .. keeping
 end
 
 -- "3 days ago", "2 hours ago", "just now"
@@ -371,17 +466,48 @@ end
 -- Events -------------------------------------------------------------------------------------------
 local nextId = 0
 
--- Adds a record to the guild's ledger. fields: who, by, from, to, level, text, src ("scan" | "game" | "user" | "sync" | "import").
+-- Adds a record to the guild's ledger, in time order (oldest first). fields: who, by, from, to, level, text, src ("scan" | "game" | "user" | "sync" | "import").
+-- An event with the same time as an existing one goes after it, so ties keep their insertion order.
 function GL:AddEvent(guild, kind, fields, t)
     nextId = nextId + 1
     local event = { t = t or self:Now(), k = kind, src = fields.src or "scan", id = string.format("%x%03d", self:Now(), nextId % 1000) }
     for key, value in pairs(fields) do
         if key ~= "src" then event[key] = value end
     end
-    guild.events[#guild.events + 1] = event
+    local list = guild.events
+    -- A join settles an earlier invite for the same person: the latest invite from a week before to two hours
+    -- after the join goes, and its inviter is kept when the join has none.
+    if kind == "join" or kind == "rejoin" then
+        for i = #list, 1, -1 do
+            local other = list[i]
+            if other.t < event.t - 604800 then break end   -- events are in time order
+            if other.k == "invite" and other.who == event.who and other.t <= event.t + 7200 then
+                if not event.by then event.by = other.by end
+                table.remove(list, i)
+                local joiner = guild.members[event.who] or guild.former[event.who]
+                if joiner and event.by then joiner.invitedBy = joiner.invitedBy or event.by end
+                break
+            end
+        end
+    end
+    -- Search from the end: new events are almost always the newest, so this usually appends.
+    local pos = #list + 1
+    while pos > 1 and list[pos - 1].t > event.t do pos = pos - 1 end
+    table.insert(list, pos, event)
     self:Announce(event, guild)
     if self.OnLedgerChanged then self:OnLedgerChanged(guild, event) end
     return event
+end
+
+-- Sorts the guild's ledger in place, oldest first. Stable: events with the same time keep their existing order.
+function GL:SortEvents(guild)
+    local list = guild.events
+    local position = {}
+    for i, event in ipairs(list) do position[event] = i end
+    table.sort(list, function(a, b)
+        if a.t ~= b.t then return a.t < b.t end
+        return position[a] < position[b]
+    end)
 end
 
 -- The most recent event of a kind about a member within `window` seconds of `t`, or nil.
@@ -393,6 +519,31 @@ function GL:FindEvent(guild, kind, who, t, window)
             if not best or math.abs(event.t - t) < math.abs(best.t - t) then best = event end
         end
         if event.t < t - window - 86400 then break end   -- events are roughly in time order
+    end
+    return best
+end
+
+-- Event kinds that describe the same happening: a rejoin is a join, a kick is a leave.
+GL.KIND_CLASS = { join = "join", rejoin = "join", leave = "leave", kick = "leave" }
+
+-- The event a game-log entry most plausibly describes: the nearest one of the same kind class about the
+-- same member, within two hours of `t` (an hour when the event itself came from the game log, whose times
+-- are only good to the hour). Events already claimed by a game-log entry (event.g) are skipped.
+-- src: where the entry came from (normally "game"). opts (optional): ignoreClaim = true also considers claimed
+-- events; exclude = an event never to return; claimed = a set (keyed by event) of events to skip.
+function GL:MatchEvent(guild, kind, who, t, src, opts)
+    opts = opts or {}
+    local class = self.KIND_CLASS[kind] or kind
+    local best, bestGap
+    for i = #guild.events, 1, -1 do
+        local event = guild.events[i]
+        if event.t < t - 7200 - 86400 then break end   -- events are roughly in time order
+        if event.who == who and (self.KIND_CLASS[event.k] or event.k) == class
+            and event ~= opts.exclude and not (opts.claimed and opts.claimed[event])
+            and (opts.ignoreClaim or not event.g) then
+            local gap = math.abs(event.t - t)
+            if gap <= (event.src == "game" and 3600 or 7200) and (not best or gap < bestGap) then best, bestGap = event, gap end
+        end
     end
     return best
 end
@@ -425,6 +576,8 @@ function GL:Describe(event, guild)
         if event.level then text = text .. " at level " .. event.level end
         if by then text = text .. ", invited by " .. by end
         return text .. "."
+    elseif kind == "invite" then
+        return name .. " was invited to the guild" .. (by and (" by " .. by) or "") .. "."
     elseif kind == "leave" or kind == "kick" then
         local text = name .. (kind == "kick" and " was removed from the guild" or " left the guild")
         if by and kind == "kick" then text = text .. " by " .. by end
