@@ -10,7 +10,9 @@
 
 local ADDON_NAME, GL = ...
 
-local WINDOW_WIDTH, WINDOW_HEIGHT = 780, 700
+-- 840 wide so the eleven tabs fit: on Forever the client lays them out itself at no less than 71 wide and 3 apart
+-- from an 11 px inset (822 in all), and will not narrow them. It was 780 with ten tabs.
+local WINDOW_WIDTH, WINDOW_HEIGHT = 840, 700
 local TOOLBAR_TOP, TOOLBAR_HEIGHT = -24, 34     -- from the top of the window
 local ROW_HEIGHT = 20
 local WHITE, YELLOW, GREY, RED, GREEN = "|cffffffff", "|cffffd100", "|cff9d9d9d", "|cffff5555", "|cff33dd33"
@@ -4649,14 +4651,6 @@ local function layoutTabs()
     end
     -- Lost the right to the archive while on its page: go to the Overview.
     if currentPage == "chat" and not show and pages.overview then showPage("overview") end
-    -- The client lays the tabs out itself (71 wide, 3 apart on Forever), and eleven of them run past the window's
-    -- 780. Its own ResizeTabsToFit narrows them; it counts only tab widths, so the gaps and the 11 px inset come off
-    -- the budget first. It does nothing when the row already fits.
-    if PanelTemplates_ResizeTabsToFit and frame.selectedTab and tabs[2] then
-        local _, _, _, gap = tabs[2]:GetPoint(1)
-        gap = tonumber(gap) or 3
-        pcall(PanelTemplates_ResizeTabsToFit, frame, WINDOW_WIDTH - 11 - 8 - gap * (#tabs - 1))
-    end
 end
 
 local function createTabs()
@@ -4668,7 +4662,7 @@ local function createTabs()
         tab:SetText(pair[2])
         tab.stock = isStock
         if previous then tab:SetPoint("TOPLEFT", previous, "TOPRIGHT", isStock and -15 or 1, 0) else tab:SetPoint("TOPLEFT", frame, "BOTTOMLEFT", 11, 2) end
-        -- 11 plain tabs of 68 and a pixel between fit along the 780 px window (stock tabs size to their text)
+        -- 11 plain tabs of 68 and a pixel between fit along the window (stock tabs are laid out by the client)
         if not isStock then tab:SetSize(68, 32) tab:SetNormalFontObject(GameFontNormalSmall) end
         tab:SetScript("OnClick", function(self)
             if PlaySound and SOUNDKIT and SOUNDKIT.IG_CHARACTER_INFO_TAB then PlaySound(SOUNDKIT.IG_CHARACTER_INFO_TAB) end
