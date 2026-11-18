@@ -54,10 +54,11 @@ end
 
 -- Housekeeping ----------------------------------------------------------------------------------------------
 -- keepEventDays: events older than this are dropped (0 = keep everything); maxEvents: hard cap, oldest first.
--- Former members who left more than two years ago and are not banned are forgotten.
+-- Former members who left more than two years ago and are not banned are forgotten. The guild chat archive
+-- (Chat.lua) is trimmed by chatKeepDays; a guild with no archive yet gets none created here.
 function GL:Housekeeping(guild, now)
     now = now or self:Now()
-    local report = { events = 0, former = 0, seen = 0 }
+    local report = { events = 0, former = 0, seen = 0, chat = 0 }
     local keepDays = setting("keepEventDays", 365)
     local maxEvents = setting("maxEvents", 20000)
     local events = guild.events
@@ -80,6 +81,9 @@ function GL:Housekeeping(guild, now)
         end
     end
     if self.Raids and self.Raids.Prune then self.Raids:Prune(guild, now) end
+    local key = self:GuildKey()
+    local store = key and self.db and self.db.chat and self.db.chat[key]
+    if store and self.Chat then report.chat = self.Chat:Trim(store, setting("chatKeepDays", 0), now) end
     return report
 end
 
@@ -118,11 +122,23 @@ frame:SetScript("OnEvent", function(self)
         local guild = GL.db and IsInGuild() and GL:Guild()
         if not guild then return end
         local ok, report = pcall(GL.Housekeeping, GL, guild)
-        if ok and (report.events > 0 or report.former > 0) then
-            GL:Print(string.format("housekeeping: dropped %d old events and %d long-gone former members (saved data about %s).", report.events, report.former, GL:DBSizeText()))
+        if ok and (report.events > 0 or report.former > 0 or report.chat > 0) then
+            local dropped = {}
+            if report.events > 0 then dropped[#dropped + 1] = string.format("%d old events", report.events) end
+            if report.former > 0 then dropped[#dropped + 1] = string.format("%d long-gone former members", report.former) end
+            if report.chat > 0 then dropped[#dropped + 1] = string.format("%d old guild chat messages", report.chat) end
+            GL:Print(string.format("housekeeping: dropped %s (saved data about %s).", table.concat(dropped, " and "), GL:DBSizeText()))
         end
     end)
 end)
+
+-- "guild chat: N messages (X KB)" for this guild's archive, or nil when there is none (nothing is created).
+local function chatArchiveText(self)
+    local key = self:GuildKey()
+    local store = key and self.db and self.db.chat and self.db.chat[key]
+    if not (store and self.Chat) then return nil end
+    return string.format("guild chat: %d messages (%d KB)", self.Chat:Count(store), math.floor(self.Chat:Bytes(store) / 1024))
+end
 
 function GL:KeepCommand(rest)
     rest = string.lower(strtrim(rest or ""))
@@ -135,11 +151,13 @@ function GL:KeepCommand(rest)
     elseif rest == "tidy" then
         if guild then
             local report = self:Housekeeping(guild)
-            self:Print(string.format("dropped %d old events and %d former members; saved data about %s.", report.events, report.former, self:DBSizeText()))
+            local chat = chatArchiveText(self)
+            self:Print(string.format("dropped %d old events, %d former members and %d guild chat messages; saved data about %s%s.", report.events, report.former, report.chat, self:DBSizeText(), chat and ("; " .. chat) or ""))
         end
     else
         local t, label = self:BackupInfo()
-        self:Print(string.format("saved data about %s; backup: %s. Commands: /tabard backup, /tabard restore, /tabard tidy.", self:DBSizeText(), t and (label .. ", " .. self:FormatTime(t)) or "none"))
+        local chat = chatArchiveText(self)
+        self:Print(string.format("saved data about %s%s; backup: %s. Commands: /tabard backup, /tabard restore, /tabard tidy.", self:DBSizeText(), chat and ("; " .. chat) or "", t and (label .. ", " .. self:FormatTime(t)) or "none"))
     end
 end
 

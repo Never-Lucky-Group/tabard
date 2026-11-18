@@ -63,6 +63,78 @@ function frameMethods.GetHighlightTexture(f) return newFrame(nil, f) end
 function frameMethods.GetPushedTexture(f) return newFrame(nil, f) end
 function frameMethods.GetFont() return "Fonts\\FRIZQT__.TTF", 12, "" end
 
+-- C_Club ------------------------------------------------------------------------------------------
+-- W.club = { id, streams = { { streamId, name, streamType } }, server = { [streamId] = { message infos, oldest first } },
+-- downloaded = { [streamId] = n } }. The client holds the newest n messages of a stream; RequestMoreMessagesBefore
+-- grows that by the request size (the test fires CLUB_MESSAGE_HISTORY_RECEIVED itself). W.club survives W.load, so
+-- a test can simulate a new session over the same server; installStubs only clears W.clubRequests.
+local function clubBefore(a, b)
+    return a.epoch < b.epoch or (a.epoch == b.epoch and (a.position or 0) < (b.position or 0))
+end
+
+local function clubFirstIndex(streamId)
+    local list = W.club.server[streamId] or {}
+    local n = (W.club.downloaded or {})[streamId] or 0
+    return math.max(#list - n + 1, 1), list
+end
+
+function W.makeClubStub()
+    local C = {}
+    function C.GetGuildClubId() return W.club and W.club.id end
+    function C.GetStreams(clubId) return W.club and W.club.streams or {} end
+    function C.GetMessageRanges(clubId, streamId)
+        local first, list = clubFirstIndex(streamId)
+        if #list == 0 or ((W.club.downloaded or {})[streamId] or 0) == 0 then return {} end
+        return { { oldestMessageId = list[first].messageId, newestMessageId = list[#list].messageId } }
+    end
+    function C.GetMessagesInRange(clubId, streamId, oldest, newest)
+        local first, list = clubFirstIndex(streamId)
+        local out = {}
+        for i = first, #list do
+            local id = list[i].messageId
+            if not clubBefore(id, oldest) and not clubBefore(newest, id) then out[#out + 1] = list[i] end
+        end
+        return out
+    end
+    function C.GetMessageInfo(clubId, streamId, messageId)
+        for _, info in ipairs(W.club.server[streamId] or {}) do
+            if info.messageId.epoch == messageId.epoch and (info.messageId.position or 0) == (messageId.position or 0) then
+                return info
+            end
+        end
+    end
+    function C.IsBeginningOfStream(clubId, streamId, messageId)
+        return ((W.club.downloaded or {})[streamId] or 0) >= #(W.club.server[streamId] or {})
+    end
+    function C.RequestMoreMessagesBefore(clubId, streamId, messageId, count)
+        W.clubRequests[#W.clubRequests + 1] = { clubId = clubId, streamId = streamId, messageId = messageId, count = count }
+        local total = #(W.club.server[streamId] or {})
+        W.club.downloaded[streamId] = math.min((W.club.downloaded[streamId] or 0) + (count or 0), total)
+        return false
+    end
+    return C
+end
+
+-- `count` message infos one second apart from startEpochSeconds, oldest first (position 0).
+function W.clubMessages(streamId, count, startEpochSeconds, author)
+    local out = {}
+    for i = 1, count do
+        out[i] = {
+            messageId = { epoch = (startEpochSeconds + i - 1) * 1e6, position = 0 },
+            author = { name = author or "Ooh Woo" },
+            content = "stream " .. streamId .. " message " .. i,
+        }
+    end
+    return out
+end
+
+-- A new message arrives on the server and is downloaded at once.
+function W.clubPost(streamId, info)
+    local list = W.club.server[streamId]
+    list[#list + 1] = info
+    W.club.downloaded[streamId] = (W.club.downloaded[streamId] or 0) + 1
+end
+
 -- Fresh state ----------------------------------------------------------------------------------
 local function installStubs()
     for k in pairs(_G) do
@@ -71,6 +143,7 @@ local function installStubs()
     frames, timers = {}, {}
     W.chat = {}
     W.rosterRequests = 0
+    W.clubRequests = {}
     W.units = { player = { "Zev", "Zev" } }
     W.party = 0
     W.roster, W.gameLog = {}, {}
@@ -87,6 +160,7 @@ local function installStubs()
     _G.C_ChatInfo = { RegisterAddonMessagePrefix = function() return true end, SendAddonMessage = noop }
     _G.C_AddOns = { GetAddOnMetadata = function(_, field) if field == "Version" then return "1.2.11" end end }
     _G.C_GuildInfo = { GuildRoster = function() W.rosterRequests = W.rosterRequests + 1 end }
+    _G.C_Club = W.makeClubStub()
     _G.hooksecurefunc = noop
     _G.StaticPopupDialogs = {}
     _G.StaticPopup_Show = noop

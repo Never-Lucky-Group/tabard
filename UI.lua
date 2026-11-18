@@ -1040,7 +1040,23 @@ local function createList(parent, buildRow, fillRow, onClick, rowHeight, extentF
     function list.SetRows(rows)
         for i, row in ipairs(rows) do if type(row) == "table" then row.index = i end end
         local provider = CreateDataProvider(rows)
+        list.provider = provider
         scrollBox:SetDataProvider(provider, ScrollBoxConstants and ScrollBoxConstants.RetainScrollPosition)
+    end
+    -- Adds rows at the end of the current data instead of replacing it, so a long list is not laid out again.
+    -- Returns false when the client's data provider cannot (the caller then sets every row).
+    function list.AppendRows(rows)
+        local provider = list.provider
+        if not (provider and provider.InsertTable and provider.GetSize) then return false end
+        local base = provider:GetSize()
+        for i, row in ipairs(rows) do if type(row) == "table" then row.index = base + i end end
+        provider:InsertTable(rows)
+        return true
+    end
+    -- Fills the shown rows again from their data, for when what a row shows changed but the rows did not.
+    function list.Redraw()
+        if not scrollBox.ForEachFrame then return end
+        scrollBox:ForEachFrame(function(button) if button.data ~= nil then fillRow(button, button.data) end end)
     end
     return list
 end
@@ -1607,6 +1623,366 @@ local function buildLogPage()
         page.filter:SetLabel(hidden == 0 and (FILTER or "Filter") or (hidden .. " hidden"))
         setText(page.count, (shown == total) and plural(total, "event") or (shown .. " of " .. plural(total, "event")))
     end
+end
+
+-- Chat page -----------------------------------------------------------------------------------------------
+-- The guild and officer chat archive (Chat.lua), for officers and up. Oldest at the top, newest at the bottom
+-- like the chat window itself. A query reads the archive, so it runs only when a filter changed or the page is
+-- entered (dirty); messages archived while the page is open are read from the last one shown and added at the
+-- end, and a ledger change only draws the visible rows again. Typing is debounced.
+-- Everything lives in one table: UI.lua's main chunk is close to Lua 5.1's limit of 200 locals.
+local chatUI = {
+    RANGES = {
+        { key = "today", label = "Today" },
+        { key = "7", label = "Last 7 days", days = 7 },
+        { key = "30", label = "Last 30 days", days = 30 },
+        { key = "all", label = "All" },
+    },
+    RANGE_LABELS = {},
+    OLDER_EVERY = 3,      -- seconds between "load older" requests from scrolling to the top
+    DEBOUNCE = 0.3,
+    state = { search = "", player = "", guild = true, officer = true, alts = true, range = "30" },
+    dirty = true,         -- the next refresh reads the archive again for the current filters
+    newFrom = nil,        -- the oldest epoch archived since the last refresh, while nothing else changed
+    redraw = false,       -- the ledger changed: the shown rows look up their members again
+    signature = nil,      -- the filters `messages` was read with
+    messages = nil,       -- the archived messages for those filters, oldest first
+    rows = nil,           -- the list rows built from `messages`, and how the build ended (lastDay, marked, mark)
+    guild = nil,          -- the ledger as of the last refresh, for looking up the member behind a drawn row
+    olderAt = -100,       -- GetTime() of the last LoadOlder
+    debounce = 0,
+}
+for _, range in ipairs(chatUI.RANGES) do chatUI.RANGE_LABELS[range.key] = range.label end
+
+-- The earliest second the date filter lets through; nil = no limit.
+function chatUI.since()
+    local range = chatUI.state.range
+    if range == "all" then return nil end
+    if range == "today" then
+        local now = date("*t", time())
+        return time({ year = now.year, month = now.month, day = now.day, hour = 0 })
+    end
+    for _, item in ipairs(chatUI.RANGES) do
+        if item.key == range and item.days then return time() - item.days * 86400 end
+    end
+    return nil
+end
+
+-- The typed player name against the ledger, ignoring case. With alts on, the member's whole alt group counts.
+-- Returns the set of author names, or nil when nothing is typed.
+function chatUI.authors(guild)
+    local typed = strtrim(chatUI.state.player or "")
+    if typed == "" then return nil end
+    local lower = string.lower(typed)
+    local found
+    if guild then
+        for _, book in ipairs({ guild.members, guild.former }) do
+            for name, member in pairs(book) do
+                if string.lower(name) == lower then found = member break end
+            end
+            if found then break end
+        end
+    end
+    local set = {}
+    if found then
+        set[found.name or typed] = true
+        if chatUI.state.alts then
+            local group = GL:GroupOf(guild, found)
+            if group then
+                if group.main then set[group.main] = true end
+                for _, alt in ipairs(group.alts or {}) do set[alt] = true end
+            end
+        end
+    else
+        set[typed] = true
+    end
+    return set
+end
+
+function chatUI.filtersSet()
+    local state = chatUI.state
+    return state.search ~= "" or strtrim(state.player or "") ~= "" or not state.guild or not state.officer or state.range ~= "all"
+end
+
+-- Brings chatUI.messages up to date. Returns "full" when it was read again (the rows must be built again), a list
+-- of messages added at its end, or nil when nothing changed.
+function chatUI.update(guild)
+    local state = chatUI.state
+    local authors = chatUI.authors(guild)
+    local names = {}
+    if authors then for name in pairs(authors) do names[#names + 1] = name end table.sort(names) end
+    local since = chatUI.since()
+    local key = GL:GuildKey()
+    -- "today" and the rolling ranges move with the clock, so the day is part of the signature
+    local signature = table.concat({ tostring(key), state.search, table.concat(names, ","), tostring(state.guild), tostring(state.officer),
+        state.range, tostring(since and date("%Y%m%d", since)) }, "\031")
+    local channels = {}
+    if state.guild then channels.g = true end
+    if state.officer then channels.o = true end
+    local store = GL.Chat:Store(key)
+    local filter = { text = state.search ~= "" and state.search or nil, authors = authors, channels = channels, since = since }
+    local messages = chatUI.messages
+    local last = messages and messages[#messages]
+    local from = chatUI.newFrom
+    chatUI.newFrom = nil
+    -- A full read on a filter change or page entry, and when older messages were filled in (a backfill or
+    -- "load older") rather than new ones added at the end.
+    if chatUI.dirty or chatUI.signature ~= signature or not messages or (from and last and from <= last.epoch) then
+        chatUI.messages = GL.Chat:Query(store, filter)
+        chatUI.signature, chatUI.dirty = signature, false
+        return "full"
+    end
+    if not from then return nil end
+    -- Everything new is at or after `from`, so read from its second on and keep what comes after the last shown.
+    local fromSecond = math.floor(from / 1e6)
+    filter.since = since and math.max(since, fromSecond) or fromSecond
+    local fresh = {}
+    for _, rec in ipairs(GL.Chat:Query(store, filter)) do
+        if not last or rec.epoch > last.epoch or (rec.epoch == last.epoch and (rec.pos or 0) > (last.pos or 0)) then
+            fresh[#fresh + 1] = rec
+            messages[#messages + 1] = rec
+        end
+    end
+    return #fresh > 0 and fresh or nil
+end
+
+-- Adds rows for `messages` to chatUI.rows and returns the added ones: a day separator when the day changes, and
+-- one divider before the first message newer than the newest one archived at login. The member behind a name is
+-- looked up when the row is drawn, so a ledger change needs no rebuild.
+function chatUI.addRows(messages)
+    local rows, added = chatUI.rows, {}
+    local mark = chatUI.mark
+    for _, rec in ipairs(messages) do
+        local seconds = math.floor(rec.epoch / 1e6)
+        local day = date("%Y%m%d", seconds)
+        if day ~= chatUI.lastDay then
+            chatUI.lastDay = day
+            added[#added + 1] = { kind = "day", text = date("%a %d %b %Y", seconds) }
+        end
+        if mark and not chatUI.marked and rec.epoch > mark then
+            chatUI.marked = true
+            added[#added + 1] = { kind = "divider", text = "New since you logged in" }
+        end
+        added[#added + 1] = { kind = "msg", epoch = rec.epoch, seconds = seconds, ch = rec.ch, author = rec.author, text = rec.text }
+    end
+    for _, row in ipairs(added) do rows[#rows + 1] = row end
+    return added
+end
+
+-- Whether the list is showing its newest end (or has nothing to scroll).
+function chatUI.atBottom(list)
+    local box = list and list.scrollBox
+    if not (box and box.GetScrollPercentage) then return true end
+    if box.HasScrollableExtent and not box:HasScrollableExtent() then return true end
+    return (box:GetScrollPercentage() or 1) >= 0.98
+end
+
+function chatUI.scrollToEnd(page)
+    local box = page.list and page.list.scrollBox
+    if not (box and box.ScrollToEnd) then return end
+    pcall(box.ScrollToEnd, box)
+    -- The list lays its rows out a moment after new data, so once more on the next frame.
+    C_Timer.After(0, function() if page.list.scrollBox.ScrollToEnd then pcall(page.list.scrollBox.ScrollToEnd, page.list.scrollBox) end end)
+end
+
+-- New data can fire the scroll callback; that is not the player reaching the top.
+function chatUI.settle(page)
+    page.settling = true
+    C_Timer.After(0.1, function() page.settling = nil end)
+end
+
+function chatUI.changed(page)
+    chatUI.dirty = true
+    page.scrollEnd = true
+    GL:RefreshWindow()
+end
+
+function chatUI.debounced(page)
+    chatUI.debounce = chatUI.debounce + 1
+    local token = chatUI.debounce
+    C_Timer.After(chatUI.DEBOUNCE, function() if token == chatUI.debounce then chatUI.changed(page) end end)
+end
+
+function chatUI.build()
+    local state = chatUI.state
+    local page = createPage("chat")
+    page.search = createSearchBox(page, function(text) state.search = text chatUI.debounced(page) end)
+    page.search:SetPoint("TOPLEFT", page, "TOPLEFT", 72, -7)
+
+    local playerLabel = page:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    playerLabel:SetPoint("LEFT", page.search, "RIGHT", 10, 0)
+    playerLabel:SetText("Player")
+    playerLabel:SetTextColor(0.62, 0.62, 0.62)
+    page.player = makeEditBox(page, 120)
+    page.player:SetPoint("LEFT", playerLabel, "RIGHT", 8, 0)
+    page.player:SetScript("OnTextChanged", function(self, userInput)
+        local text = self:GetText() or ""
+        if text ~= state.player then state.player = text chatUI.debounced(page) end
+    end)
+    explain(page.player, "Only messages from this character. With \"Include alts\" on, from their whole alt group.")
+
+    local function setRange(key) state.range = key chatUI.changed(page) end
+    local items = {
+        { text = "Guild", isChecked = function() return state.guild end, toggle = function() state.guild = not state.guild chatUI.changed(page) end },
+        { text = "Officer", isChecked = function() return state.officer end, toggle = function() state.officer = not state.officer chatUI.changed(page) end },
+        { separator = true },
+        { text = "Include alts", isChecked = function() return state.alts end, toggle = function() state.alts = not state.alts chatUI.changed(page) end },
+        { separator = true },
+    }
+    for _, range in ipairs(chatUI.RANGES) do
+        items[#items + 1] = { text = range.label, isChecked = function() return state.range == range.key end, toggle = function() setRange(range.key) end }
+    end
+    page.filter = createFilter(page, FILTER or "Filter", items, 120)
+    page.filter:SetPoint("RIGHT", page, "TOPRIGHT", -10, -TOOLBAR_HEIGHT / 2)
+    page.count:SetPoint("RIGHT", page.filter, "LEFT", -10, 0)
+
+    -- The list sits above a one-line status at the bottom of the body.
+    local listArea = CreateFrame("Frame", nil, page.body)
+    listArea:SetPoint("TOPLEFT", page.body, "TOPLEFT", 0, 0)
+    listArea:SetPoint("BOTTOMRIGHT", page.body, "BOTTOMRIGHT", 0, 18)
+    page.status = page.body:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    page.status:SetPoint("BOTTOMLEFT", page.body, "BOTTOMLEFT", 8, 4)
+    page.status:SetPoint("BOTTOMRIGHT", page.body, "BOTTOMRIGHT", -8, 4)
+    page.status:SetJustifyH("LEFT")
+
+    page.list = createList(listArea,
+        function(row)
+            row.time = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+            row.time:SetPoint("LEFT", row, "LEFT", 8, 0)
+            row.time:SetWidth(36)
+            row.time:SetJustifyH("LEFT")
+            row.time:SetTextColor(0.62, 0.62, 0.62)
+            row.author = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.author:SetPoint("LEFT", row.time, "RIGHT", 4, 0)
+            row.author:SetWidth(110)
+            row.author:SetJustifyH("LEFT")
+            row.author:SetWordWrap(false)
+            row.text = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+            row.text:SetPoint("LEFT", row.author, "RIGHT", 6, 0)
+            row.text:SetPoint("RIGHT", row, "RIGHT", -6, 0)
+            row.text:SetJustifyH("LEFT")
+            row.text:SetWordWrap(false)
+            row.heading = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+            row.heading:SetPoint("LEFT", row, "LEFT", 8, 1)
+            row.headingRule = solid(row, "ARTWORK", 1, 1, 1, 0.12)
+            row.headingRule:SetPoint("BOTTOMLEFT", row, "BOTTOMLEFT", 6, 1)
+            row.headingRule:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", -6, 1)
+            row.headingRule:SetHeight(1)
+            row:SetScript("OnEnter", function(self)
+                local data = self.data
+                if not (data and data.kind == "msg") then return end
+                local lines = {}
+                local truncated = self.text.IsTruncated and self.text:IsTruncated()
+                if truncated then
+                    lines[#lines + 1] = { data.author .. ": " .. data.text }
+                    lines[#lines + 1] = { date("%a %d %b %Y %H:%M", data.seconds), 0.62, 0.62, 0.62 }
+                end
+                if not data.member then lines[#lines + 1] = { "Not in Tabard's records", 0.62, 0.62, 0.62 } end
+                if #lines > 0 then tooltipLines(self, lines) end
+            end)
+            row:SetScript("OnLeave", function() if GameTooltip then GameTooltip:Hide() end end)
+        end,
+        function(row, data)
+            if data.kind ~= "msg" then
+                row.zebra:Hide()
+                row.time:Hide() row.author:Hide() row.text:Hide()
+                row.heading:SetText(data.text)
+                if data.kind == "divider" then row.heading:SetTextColor(0.4, 0.67, 1) else row.heading:SetTextColor(1, 0.82, 0) end
+                row.heading:Show() row.headingRule:Show()
+                return
+            end
+            row.heading:Hide() row.headingRule:Hide()
+            row.time:Show() row.author:Show() row.text:Show()
+            -- Looked up on every draw, so a ledger change shows without rebuilding the rows (the tooltip reads it too).
+            data.member = GL:Member(chatUI.guild, data.author)
+            setText(row.time, date("%H:%M", data.seconds))
+            local r, g, b = 1, 1, 1
+            if data.member then r, g, b = GL:ClassColor(data.member.class) end
+            row.author:SetTextColor(r, g, b)
+            setText(row.author, data.author)
+            setText(row.text, data.ch == "o" and ("|cff40ff40" .. plain(data.text) .. "|r") or plain(data.text))
+        end,
+        function(row, data)
+            if data.kind ~= "msg" then return end
+            local guild = GL:Guild()
+            local member = guild and GL:Member(guild, data.author)
+            if member then openCard(member) end
+        end)
+
+    -- Scrolled to the top with every date shown: ask the game for older messages, at most every few seconds.
+    local box = page.list.scrollBox
+    if box and box.RegisterCallback and BaseScrollBoxEvents and BaseScrollBoxEvents.OnScroll then
+        pcall(box.RegisterCallback, box, BaseScrollBoxEvents.OnScroll, function(_, percent)
+            if page.settling or state.range ~= "all" then return end
+            if type(percent) ~= "number" or percent > 0 then return end
+            local now = GetTime()
+            if now - chatUI.olderAt < chatUI.OLDER_EVERY then return end
+            chatUI.olderAt = now
+            if GL.Chat:Eligible() then GL.Chat:LoadOlder() page.status:SetText(GL.Chat:Status()) end
+        end, page)
+    end
+
+    page.refresh = function()
+        local guild = GL:Guild()
+        chatUI.guild = guild   -- for the row drawing, which happens while scrolling too
+        if not (guild and GL.Chat:Eligible()) then
+            page.list.SetRows({})
+            chatUI.rows, chatUI.dirty = nil, true
+            showEmpty(page, "The guild chat archive is for officers and up, and is switched off in Settings or not available for your rank.")
+            setText(page.count, "")
+            setText(page.status, "")
+            return
+        end
+        local change = chatUI.update(guild)
+        local messages = chatUI.messages
+        local stick = page.scrollEnd or chatUI.atBottom(page.list)
+        page.scrollEnd = nil
+        local mark = GL.Chat.loginMark
+        if change == "full" or not chatUI.rows or chatUI.mark ~= mark then
+            chatUI.rows, chatUI.lastDay, chatUI.marked, chatUI.mark = {}, nil, false, mark
+            chatUI.addRows(messages)
+            chatUI.settle(page)
+            page.list.SetRows(chatUI.rows)
+        else
+            if change then
+                local added = chatUI.addRows(change)
+                chatUI.settle(page)
+                if not (page.list.AppendRows and page.list.AppendRows(added)) then page.list.SetRows(chatUI.rows) end
+            end
+            if chatUI.redraw and page.list.Redraw then page.list.Redraw() end
+        end
+        chatUI.redraw = false
+        if stick then chatUI.scrollToEnd(page) end
+        if #messages == 0 then
+            local store = GL.Chat:Store(GL:GuildKey())
+            if store and next(store.days) ~= nil and chatUI.filtersSet() then
+                showEmpty(page, "No messages match.")
+            else
+                showEmpty(page, "No guild chat archived yet. Messages are saved as they arrive and from the game's recent history.")
+            end
+        else
+            showEmpty(page, nil)
+        end
+        page.filter:SetLabel(chatUI.RANGE_LABELS[state.range] or "Filter")
+        setText(page.count, plural(#messages, "message"))
+        setText(page.status, GL.Chat:Status() or "")
+    end
+end
+
+-- Chat.lua calls this (at most once a second) after it archives messages, with the oldest epoch among them.
+function GL:OnChatChanged(from)
+    if type(from) == "number" and not chatUI.dirty then
+        if not chatUI.newFrom or from < chatUI.newFrom then chatUI.newFrom = from end
+    else
+        chatUI.dirty = true
+    end
+    if frame and frame:IsShown() and currentPage == "chat" then GL:RefreshWindow() end
+end
+
+-- Chat.lua calls this when a backfill or a "load older" walk ends: only the status line can have changed.
+function GL:OnChatStatus()
+    local page = pages.chat
+    if page and page.status and frame and frame:IsShown() and currentPage == "chat" then setText(page.status, GL.Chat:Status() or "") end
 end
 
 -- Members page --------------------------------------------------------------------------------------------
@@ -3335,15 +3711,21 @@ local function buildSettingsPage()
         { key = "hints", label = "Show the main's name, or the nickname, after names in guild chat", default = true },
         { key = "requests", label = "Accept requests whispered to you (!main, !bday, !loa); they land on the To-do tab", default = true },
         { key = "inviteBar", label = "Offer an Invite button when someone outside the guild whispers you (your click sends it)", default = true },
+        { key = "chatArchive", label = "Keep a guild chat archive (officers and up)", default = true },
         { key = "raidTracking", label = "Track raid attendance, bench and loot while you are in a raid group", default = true },
     }
-    local behaviourHeight = 34 + 15 * 30 + 6
+    local behaviourHeight = 34 + 16 * 30 + 6
     page.behaviourBox = section(content, "Sharing and tooltips", rightX, -PAD, rightWidth, behaviourHeight)
     page.options = {}
     page.optionDefaults = {}
     y = 2
     for _, option in ipairs(options) do
-        local box = makeCheck(page.behaviourBox.body, option.label, function(checked) GL.settings[option.key] = checked GL:RefreshWindow() end)
+        local box = makeCheck(page.behaviourBox.body, option.label, function(checked)
+            GL.settings[option.key] = checked
+            -- Turning the archive on starts capture now, not at the next login (Start does nothing once started).
+            if option.key == "chatArchive" and checked and GL.Chat then pcall(GL.Chat.Start, GL.Chat) end
+            GL:RefreshWindow()
+        end)
         box:SetPoint("TOPLEFT", page.behaviourBox.body, "TOPLEFT", -4, y)
         box.label:SetWidth(rightWidth - 56)
         box.label:SetJustifyH("LEFT")
@@ -3444,9 +3826,10 @@ local function buildSettingsPage()
         { key = "trialDays", label = "days in the trial rank before a review is due", default = 14 },
         { key = "strikeDays", label = "days a strike counts (0 = forever)", default = 90 },
         { key = "keepEventDays", label = "days of history to keep; older events are tidied away (0 = keep all)", default = 365 },
+        { key = "chatKeepDays", label = "days of guild chat to keep (0 = keep all)", default = 0 },
     }
     local thresholdsTop = -PAD - behaviourHeight - GAP
-    local thresholdsHeight = 34 + 8 * 26 + 6
+    local thresholdsHeight = 34 + 9 * 26 + 6
     page.thresholdBox = section(content, "Thresholds", rightX, thresholdsTop, rightWidth, thresholdsHeight)
     page.numbers = {}
     y = -2
@@ -4223,7 +4606,7 @@ cardAdvance = function(member)
 end
 
 -- Tabs ------------------------------------------------------------------------------------------------------
-local TAB_ORDER = { { "overview", "Overview" }, { "todo", "To-do" }, { "log", "Log" }, { "members", "Members" }, { "play", "Play" }, { "former", "Former" }, { "bans", "Bans" }, { "tools", "Tools" }, { "export", "Export" }, { "settings", "Settings" } }
+local TAB_ORDER = { { "overview", "Overview" }, { "todo", "To-do" }, { "log", "Log" }, { "chat", "Chat" }, { "members", "Members" }, { "play", "Play" }, { "former", "Former" }, { "bans", "Bans" }, { "tools", "Tools" }, { "export", "Export" }, { "settings", "Settings" } }
 local TAB_KEYS = {}
 for _, pair in ipairs(TAB_ORDER) do TAB_KEYS[pair[1]] = true end
 
@@ -4235,6 +4618,8 @@ showPage = function(key, opened, keepFilter)
     if not pages[key] then return end
     if key == "log" and not keepFilter and (opened or currentPage ~= "log") then GL:ResetLogFilter() end
     if GL.Usage and (opened or key ~= currentPage) then pcall(GL.Usage.Page, GL.Usage, key) end
+    -- Entering the Chat lands on the newest messages, from a fresh read of the archive.
+    if key == "chat" and (opened or currentPage ~= "chat") then pages.chat.scrollEnd = true chatUI.dirty = true end
     currentPage = key
     for name, page in pairs(pages) do
         if name == key then page:Show() else page:Hide() end
@@ -4245,6 +4630,24 @@ showPage = function(key, opened, keepFilter)
     GL:RefreshWindow()
 end
 
+-- The Chat tab only exists for players the archive is for; the tabs after it close the gap.
+local function layoutTabs()
+    local previous
+    for _, tab in ipairs(tabs) do
+        local visible = tab.key ~= "chat" or (GL.Chat and GL.Chat:Eligible()) and true or false
+        if visible then
+            tab:Show()
+            tab:ClearAllPoints()
+            if previous then tab:SetPoint("TOPLEFT", previous, "TOPRIGHT", tab.stock and -15 or 1, 0) else tab:SetPoint("TOPLEFT", frame, "BOTTOMLEFT", 11, 2) end
+            previous = tab
+        else
+            tab:Hide()
+        end
+    end
+    -- Lost the right to the archive while on its page: go to the Overview.
+    if currentPage == "chat" and not (GL.Chat and GL.Chat:Eligible()) and pages.overview then showPage("overview") end
+end
+
 local function createTabs()
     local previous
     for i, pair in ipairs(TAB_ORDER) do
@@ -4252,8 +4655,10 @@ local function createTabs()
         tab.key = pair[1]
         tab:SetID(i)
         tab:SetText(pair[2])
+        tab.stock = isStock
         if previous then tab:SetPoint("TOPLEFT", previous, "TOPRIGHT", isStock and -15 or 1, 0) else tab:SetPoint("TOPLEFT", frame, "BOTTOMLEFT", 11, 2) end
-        if not isStock then tab:SetSize(80, 32) tab:SetNormalFontObject(GameFontNormalSmall) end
+        -- 11 plain tabs of 68 and a pixel between fit along the 780 px window (stock tabs size to their text)
+        if not isStock then tab:SetSize(68, 32) tab:SetNormalFontObject(GameFontNormalSmall) end
         tab:SetScript("OnClick", function(self)
             if PlaySound and SOUNDKIT and SOUNDKIT.IG_CHARACTER_INFO_TAB then PlaySound(SOUNDKIT.IG_CHARACTER_INFO_TAB) end
             showPage(self.key)
@@ -4271,6 +4676,7 @@ local function createTabs()
     frame.artButton:SetFrameLevel((tonumber(frame:GetFrameLevel()) or 0) + 10)
     explain(frame.artButton, "The art behind the window. Settings has the brightness.")
     if PanelTemplates_SetNumTabs then pcall(PanelTemplates_SetNumTabs, frame, #tabs) end
+    layoutTabs()
 end
 
 -- Public --------------------------------------------------------------------------------------------------
@@ -4287,6 +4693,7 @@ function GL:RefreshWindow()
             local name = guild and plain(guild.name or "") or ""
             setWindowTitle(frame, name ~= "" and name or "Tabard")
         end
+        if #tabs > 0 then pcall(layoutTabs) end
         if frame:IsShown() and currentPage then
             local page = pages[currentPage]
             local ok, err = pcall(page.refresh)
@@ -4300,6 +4707,7 @@ function GL:RefreshWindow()
 end
 
 function GL:OnLedgerChanged()
+    chatUI.redraw = true   -- the Chat rows look up their members when drawn
     self:RefreshWindow()
 end
 
@@ -4324,6 +4732,7 @@ local function ensureWindow()
         buildOverviewPage()
         buildTodoPage()
         buildLogPage()
+        chatUI.build()
         buildMembersPage()
         buildPlayPage()
         buildFormerPage()
