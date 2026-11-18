@@ -22,9 +22,10 @@ local function clean(s)
     return (string.gsub(tostring(s or ""), "[\030\031]", ""))
 end
 
--- %.0f keeps all sixteen digits of a microsecond epoch; tostring would turn it into 1.763e+15.
+-- %.0f keeps all sixteen digits of a microsecond epoch (tostring would turn it into 1.763e+15), and the 14-digit
+-- C_Club positions Forever sends: the game's %d only takes 32-bit integers and raises "integer overflow" past them.
 function Chat.Encode(rec)
-    return string.format("%.0f", rec.epoch) .. FIELD .. string.format("%d", rec.pos or 0) .. FIELD .. rec.ch
+    return string.format("%.0f", rec.epoch) .. FIELD .. string.format("%.0f", rec.pos or 0) .. FIELD .. rec.ch
         .. FIELD .. rec.author .. FIELD .. rec.text
 end
 
@@ -67,7 +68,7 @@ local function before(e1, p1, e2, p2)
 end
 
 local function idKey(epoch, pos)
-    return string.format("%.0f", epoch) .. ":" .. string.format("%d", pos)
+    return string.format("%.0f", epoch) .. ":" .. string.format("%.0f", pos)
 end
 
 -- Storage ---------------------------------------------------------------------------------------------------
@@ -76,9 +77,12 @@ function Chat:Store(guildKey)
     GL.db.chat = GL.db.chat or {}
     local store = GL.db.chat[guildKey]
     if not store then
-        store = { days = {}, newest = {}, caughtUp = {}, begin = {} }
+        store = { days = {}, newest = {}, caughtUp = {}, begin = {}, v = 2 }
         GL.db.chat[guildKey] = store
     end
+    -- 1.4.0 could not archive Forever's 14-digit message positions yet still marked how far back the archive was
+    -- complete; drop those marks once so the next backfill walks the server's history again (duplicates are skipped).
+    if store.v ~= 2 then store.caughtUp, store.begin, store.v = {}, {}, 2 end
     store.days = store.days or {}
     store.newest = store.newest or {}
     store.caughtUp = store.caughtUp or {}
@@ -484,7 +488,8 @@ function Chat:Finish(ch)
     self.active[ch], self.pending[ch] = nil, nil
     if mode == "backfill" then
         local epoch, pos = Chat:NewestId(self.store, ch)
-        if epoch then self.store.caughtUp[ch] = { epoch, pos } end
+        -- A message skipped this session is a hole the mark would hide for good; leave it for a later session.
+        if epoch and self.messageErrors == 0 then self.store.caughtUp[ch] = { epoch, pos } end
     end
 end
 
@@ -530,7 +535,7 @@ local function step(self, ch)
     local ok, begin = self:Call("IsBeginningOfStream", self.clubId, self.streams[ch], oldest)
     if self.disabled then return end
     if ok and begin then
-        self.store.begin[ch] = true
+        if self.messageErrors == 0 then self.store.begin[ch] = true end
         self:Finish(ch)
         return
     end
@@ -675,7 +680,7 @@ function Chat:OnHistory(clubId, streamId)
                 local oldest = self:Oldest(ch)
                 if oldest then
                     local ok, begin = self:Call("IsBeginningOfStream", self.clubId, stream, oldest)
-                    if ok and begin then self.store.begin[ch] = true end
+                    if ok and begin and self.messageErrors == 0 then self.store.begin[ch] = true end
                 end
             end
         end

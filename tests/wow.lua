@@ -10,6 +10,25 @@ baseline.W = true
 
 local frames, timers, events
 
+-- The game's string.format stores %d, %i, %c, %o, %u, %x and %X arguments in a 32-bit integer and raises
+-- "integer overflow attempting to store N" beyond it; plain Lua 5.1 does not. Copy that here so code that
+-- formats large ids (C_Club message positions run to 14 digits) fails offline the way it fails in game.
+local plainFormat = string.format
+string.format = function(fmt, ...)
+    local args, n = { ... }, select("#", ...)
+    local i = 0
+    for spec in string.gmatch(tostring(fmt), "%%[-+ #0]*%d*%.?%d*(.)") do
+        if spec ~= "%" then
+            i = i + 1
+            local v = args[i]
+            if i <= n and string.find("dicouxX", spec, 1, true) and type(v) == "number" and (v > 2147483647 or v < -2147483648) then
+                error("integer overflow attempting to store " .. plainFormat("%.0f", v), 2)
+            end
+        end
+    end
+    return plainFormat(fmt, ...)
+end
+
 -- Frames --------------------------------------------------------------------------------------
 local noop = function() end
 local frameMethods = {}
