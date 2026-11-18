@@ -123,6 +123,7 @@ function W.makeClubStub()
         end
     end
     function C.IsBeginningOfStream(clubId, streamId, messageId)
+        if W.club.noBeginning then return false end   -- WoW Forever answers false even at the guild's first message
         return ((W.club.downloaded or {})[streamId] or 0) >= #(W.club.server[streamId] or {})
     end
     function C.RequestMoreMessagesBefore(clubId, streamId, messageId, count)

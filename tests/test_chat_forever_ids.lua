@@ -89,3 +89,44 @@ test("an archive saved by 1.4.0 is walked again once", function()
     GL = session(GL.db)
     eq(GL.Chat:Store(KEY).caughtUp.g ~= nil, true, "only once")
 end)
+
+-- WoW Forever's C_Club.IsBeginningOfStream answers false even for the guild's very first message, so a walk that
+-- trusted it asked for older history that does not exist until its request cap, showing "Loading older messages"
+-- the whole time. A request that brings nothing older, a few times running, is the start of the stream.
+local function drive()
+    for _ = 1, 400 do
+        local before = #W.clubRequests
+        W.fire("CLUB_MESSAGE_HISTORY_RECEIVED", CLUB, GUILD)
+        W.runTimers()
+        if #W.clubRequests == before then return end
+    end
+end
+
+test("a backfill ends at the stream's start when the game never says it is the beginning", function()
+    newClub(250)
+    W.club.downloaded[GUILD] = 100
+    W.club.noBeginning = true
+    local GL = session()
+    W.clubRequests = {}
+    GL.Chat:Start()
+    drive()
+    local store = GL.Chat:Store(KEY)
+    eq(GL.Chat:Count(store), 250, "all archived")
+    ok(#W.clubRequests <= 6, "stopped soon after the start (" .. #W.clubRequests .. " requests)")
+    eq(store.begin.g, true, "start of history recorded")
+    ok(store.caughtUp.g ~= nil, "caught up")
+    eq(GL.Chat:Status(), "That's the start of the server's history", "status says so")
+end)
+
+test("load older stops asking once the stream's start is found that way", function()
+    newClub(50)
+    W.club.noBeginning = true
+    local GL = session()
+    GL.Chat:Start()
+    drive()
+    W.clubRequests = {}
+    GL.Chat:LoadOlder()
+    drive()
+    eq(#W.clubRequests, 0, "no requests past the start")
+    eq(GL.Chat:Status(), "That's the start of the server's history", "status")
+end)

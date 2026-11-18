@@ -281,6 +281,7 @@ local SETTLE = 2          -- seconds after a history event before the next reque
 local WATCHDOG = 15       -- seconds without a history event before a request is repeated
 local MAX_REQUESTS = 200  -- per channel and session for the backfill, and per "load older" walk
 local BATCH = 100
+local STALLS = 3          -- requests in a row that bring nothing older: the start of the stream (see step)
 local REQUIRED = { "GetGuildClubId", "GetStreams", "GetMessageRanges", "GetMessagesInRange", "GetMessageInfo",
     "IsBeginningOfStream", "RequestMoreMessagesBefore" }
 
@@ -302,6 +303,8 @@ Chat.readTo = {}       -- only what the downloaded range gained beyond them
 Chat.goal = {}         -- for a "load older" walk: the archive's oldest record when it began, or false for none
 Chat.beyond = {}       -- for a "load older" walk: the batch past the archive's oldest has been asked for
 Chat.olderCount = {}   -- requests made by the current "load older" walk
+Chat.lastAsked = {}    -- the oldest message id the last request asked before, per channel (kept for the session)
+Chat.stalls = {}       -- steps in a row whose downloaded range came back no older than that request asked
 Chat.changedFrom = nil -- the oldest epoch archived since the last GL:OnChatChanged
 Chat.messageErrors = 0
 
@@ -472,6 +475,7 @@ end
 function Chat:Request(ch, oldest)
     local ok = self:Call("RequestMoreMessagesBefore", self.clubId, self.streams[ch], oldest, BATCH)
     if not ok then return end
+    self.lastAsked[ch] = { oldest.epoch, oldest.position or 0 }
     self.pending[ch] = true
     self.token[ch] = (self.token[ch] or 0) + 1
     local token = self.token[ch]
@@ -534,7 +538,15 @@ local function step(self, ch)
     end
     local ok, begin = self:Call("IsBeginningOfStream", self.clubId, self.streams[ch], oldest)
     if self.disabled then return end
-    if ok and begin then
+    -- WoW Forever answers false even at the guild's first message, so a request that brings nothing older, a few
+    -- times running, also means the start. Kept across walks: "load older" after a finished backfill counts on.
+    local asked = self.lastAsked[ch]
+    if asked and asked[1] == oldest.epoch and asked[2] == (oldest.position or 0) then
+        self.stalls[ch] = (self.stalls[ch] or 0) + 1
+    else
+        self.stalls[ch] = 0
+    end
+    if (ok and begin) or self.stalls[ch] >= STALLS then
         if self.messageErrors == 0 then self.store.begin[ch] = true end
         self:Finish(ch)
         return
