@@ -1882,7 +1882,25 @@ function chatUI.build()
                 if not data.member then lines[#lines + 1] = { "Not in Tabard's records", 0.62, 0.62, 0.62 } end
                 if #lines > 0 then tooltipLines(self, lines) end
             end)
-            row:SetScript("OnLeave", function() if GameTooltip then GameTooltip:Hide() end end)
+            row:SetScript("OnLeave", function(self) self.overLink = nil if GameTooltip then GameTooltip:Hide() end end)
+            -- Item, spell and other links in a message work as in the chat window: hovering shows the tooltip, a click
+            -- goes to the game's own link handler (the item window; shift-click puts the link in the chat box).
+            if row.SetHyperlinksEnabled then
+                row:SetHyperlinksEnabled(true)
+                row:SetScript("OnHyperlinkEnter", function(self, link)
+                    self.overLink = true
+                    if not GameTooltip then return end
+                    GameTooltip:SetOwner(self, "ANCHOR_CURSOR")
+                    if pcall(GameTooltip.SetHyperlink, GameTooltip, link) then GameTooltip:Show() else GameTooltip:Hide() end
+                end)
+                row:SetScript("OnHyperlinkLeave", function(self)
+                    self.overLink = nil
+                    if GameTooltip then GameTooltip:Hide() end
+                end)
+                row:SetScript("OnHyperlinkClick", function(self, link, text, button)
+                    if SetItemRef then pcall(SetItemRef, link, text, button, self) end
+                end)
+            end
         end,
         function(row, data)
             if data.kind ~= "msg" then
@@ -1905,7 +1923,8 @@ function chatUI.build()
             setText(row.text, data.ch == "o" and ("|cff40ff40" .. plain(data.text) .. "|r") or plain(data.text))
         end,
         function(row, data)
-            if data.kind ~= "msg" then return end
+            -- A click on a link is the link's (OnHyperlinkClick above), not the row's.
+            if data.kind ~= "msg" or row.overLink then return end
             local guild = GL:Guild()
             local member = guild and GL:Member(guild, data.author)
             if member then openCard(member) end
