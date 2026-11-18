@@ -4630,22 +4630,25 @@ showPage = function(key, opened, keepFilter)
     GL:RefreshWindow()
 end
 
--- The Chat tab only exists for players the archive is for; the tabs after it close the gap.
+-- The Chat tab only exists for players the archive is for; the tab after it closes the gap. Tabs are touched
+-- only when that changes: re-anchoring every tab on each redraw undid the client's own tab spacing and squeezed
+-- the row together. The tab after Chat takes over Chat's own anchor, so the spacing stays the client's.
 local function layoutTabs()
-    local previous
-    for _, tab in ipairs(tabs) do
-        local visible = tab.key ~= "chat" or (GL.Chat and GL.Chat:Eligible()) and true or false
-        if visible then
-            tab:Show()
-            tab:ClearAllPoints()
-            if previous then tab:SetPoint("TOPLEFT", previous, "TOPRIGHT", tab.stock and -15 or 1, 0) else tab:SetPoint("TOPLEFT", frame, "BOTTOMLEFT", 11, 2) end
-            previous = tab
-        else
-            tab:Hide()
+    local show = (GL.Chat and GL.Chat:Eligible()) and true or false
+    if tabs.chatShown ~= show then
+        tabs.chatShown = show
+        for i, tab in ipairs(tabs) do
+            local nextTab = tabs[i + 1]
+            if tab.key == "chat" and tabs[i - 1] and nextTab then
+                local _, _, _, x, y = tab:GetPoint(1)
+                nextTab:ClearAllPoints()
+                nextTab:SetPoint("TOPLEFT", show and tab or tabs[i - 1], "TOPRIGHT", x or 0, y or 0)
+                if show then tab:Show() else tab:Hide() end
+            end
         end
     end
     -- Lost the right to the archive while on its page: go to the Overview.
-    if currentPage == "chat" and not (GL.Chat and GL.Chat:Eligible()) and pages.overview then showPage("overview") end
+    if currentPage == "chat" and not show and pages.overview then showPage("overview") end
 end
 
 local function createTabs()
