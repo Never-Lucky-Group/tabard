@@ -4649,6 +4649,14 @@ local function layoutTabs()
     end
     -- Lost the right to the archive while on its page: go to the Overview.
     if currentPage == "chat" and not show and pages.overview then showPage("overview") end
+    -- The client lays the tabs out itself (71 wide, 3 apart on Forever), and eleven of them run past the window's
+    -- 780. Its own ResizeTabsToFit narrows them; it counts only tab widths, so the gaps and the 11 px inset come off
+    -- the budget first. It does nothing when the row already fits.
+    if PanelTemplates_ResizeTabsToFit and frame.selectedTab and tabs[2] then
+        local _, _, _, gap = tabs[2]:GetPoint(1)
+        gap = tonumber(gap) or 3
+        pcall(PanelTemplates_ResizeTabsToFit, frame, WINDOW_WIDTH - 11 - 8 - gap * (#tabs - 1))
+    end
 end
 
 local function createTabs()
