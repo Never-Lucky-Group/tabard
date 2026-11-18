@@ -22,6 +22,15 @@ local function clean(s)
     return (string.gsub(tostring(s or ""), "[\030\031]", ""))
 end
 
+-- The game's stand-in for message text it does not hold. One capture on Forever saved "Unknown" as the text of
+-- thousands of messages (a clean capture did not repeat it), so a stand-in is never archived, and a saved one
+-- gives way to the real text when that comes along. The cost: a message that is only the word "Unknown" is lost.
+local STAND_IN = "stand-in"
+local function standIn(text)
+    return text == "Unknown" or (type(UNKNOWNOBJECT) == "string" and text == UNKNOWNOBJECT)
+        or (type(UNKNOWN) == "string" and text == UNKNOWN)
+end
+
 -- %.0f keeps all sixteen digits of a microsecond epoch (tostring would turn it into 1.763e+15), and the 14-digit
 -- C_Club positions Forever sends: the game's %d only takes 32-bit integers and raises "integer overflow" past them.
 function Chat.Encode(rec)
@@ -103,7 +112,7 @@ local function daySet(store, key)
         if day then
             for _, line in ipairs(split(day)) do
                 local epoch, pos = rawId(line)
-                if epoch then set[idKey(epoch, pos)] = true end
+                if epoch then set[idKey(epoch, pos)] = standIn(string.match(line, "\031([^\031]*)$")) and STAND_IN or true end
             end
         end
         sets[key] = set
@@ -117,11 +126,27 @@ function Chat:Add(store, rec)
     local key = dayKeyOf(rec.epoch)
     local set = daySet(store, key)
     local id = idKey(rec.epoch, pos)
-    if set[id] then return false end
+    local text = clean(rec.text)
+    if set[id] then
+        if set[id] ~= STAND_IN or standIn(text) then return false end
+        -- A saved stand-in and now the real text: put the text into the saved record.
+        local lines = split(store.days[key])
+        for i, existing in ipairs(lines) do
+            local e, p = rawId(existing)
+            if e == rec.epoch and p == pos then
+                local old = Chat.Decode(existing)
+                if old then lines[i] = Chat.Encode({ epoch = old.epoch, pos = old.pos, ch = old.ch, author = old.author, text = text }) end
+                break
+            end
+        end
+        store.days[key] = table.concat(lines, RECORD)
+        set[id] = true
+        return true
+    end
     local line = Chat.Encode({
         epoch = rec.epoch, pos = pos, ch = rec.ch,
         author = (rec.author and rec.author ~= "") and clean(rec.author) or "?",
-        text = clean(rec.text),
+        text = text,
     })
     local day = store.days[key]
     if not day then
@@ -143,7 +168,7 @@ function Chat:Add(store, rec)
             store.days[key] = table.concat(lines, RECORD)
         end
     end
-    set[id] = true
+    set[id] = standIn(text) and STAND_IN or true
     local newest = store.newest[rec.ch]
     if not newest or before(newest[1], newest[2], rec.epoch, pos) then
         store.newest[rec.ch] = { rec.epoch, pos }
@@ -389,6 +414,7 @@ local function toRecord(ch, info)
     if info.destroyed then return nil end
     local id = info.messageId
     if type(id.epoch) ~= "number" then error("message has no epoch") end
+    if standIn(info.content) then error("the game had not loaded its text yet") end
     return {
         epoch = id.epoch, pos = id.position or 0, ch = ch,
         author = GL:ShortName(info.author and info.author.name) or "?",

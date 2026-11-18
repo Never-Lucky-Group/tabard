@@ -130,3 +130,35 @@ test("load older stops asking once the stream's start is found that way", functi
     eq(#W.clubRequests, 0, "no requests past the start")
     eq(GL.Chat:Status(), "", "status")
 end)
+
+-- One capture on Forever saved "Unknown" as the text of thousands of messages (the game's stand-in for text it does
+-- not hold); a clean capture did not repeat it. A stand-in is never saved, and a saved one gives way to real text.
+test("a message whose text is the game's Unknown stand-in is not archived and blocks the complete marks", function()
+    newClub(3)
+    W.club.server[GUILD][2].content = "Unknown"
+    local GL = session()
+    W.clearChat()
+    GL.Chat:Start()
+    W.runTimers()
+    local store = GL.Chat:Store(KEY)
+    eq(GL.Chat:Count(store), 2, "the stand-in is not saved")
+    eq(store.caughtUp.g, nil, "not marked caught up")
+    eq(store.begin.g, nil, "not marked at the start")
+    eq(lines("guild chat archive skipped a message"), 1, "mentioned once")
+end)
+
+test("a saved Unknown stand-in is replaced when the real text comes along", function()
+    local GL = session()
+    local store = GL.Chat:Store(KEY)
+    local function rec(text) return { epoch = (BASE + 1) * 1e6, pos = POSITION, ch = "g", author = "Ooh Woo", text = text } end
+    GL.Chat:Add(store, rec("Unknown"))
+    GL.Chat:Add(store, { epoch = (BASE + 2) * 1e6, pos = POSITION + 1, ch = "g", author = "Ooh Woo", text = "later" })
+    GL = session(GL.db)   -- as after a reload: the day's ids are read back from the saved string
+    store = GL.Chat:Store(KEY)
+    eq(GL.Chat:Add(store, rec("the real words")), true, "replaced")
+    eq(GL.Chat:Add(store, rec("the real words")), false, "and then a plain duplicate")
+    local got = GL.Chat:Query(store, {})
+    eq(#got, 2, "still two records")
+    eq(got[1].text, "the real words", "real text kept")
+    eq(got[2].text, "later", "the neighbour untouched")
+end)
