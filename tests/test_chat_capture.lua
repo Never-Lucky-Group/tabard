@@ -94,7 +94,7 @@ test("an empty archive backfills to the start of the stream and sets newest", fu
     local e = GL.Chat:NewestId(guildStore(GL), "g")
     eq(e, (BASE + 250) * 1e6, "newest is the newest message")
     eq(guildStore(GL).caughtUp.g[1], e, "caughtUp.g set on completion")
-    eq(GL.Chat:Status(), "That's the start of the server's history", "status")
+    eq(GL.Chat:Status(), "", "status")
 end)
 
 test("backfill stops once the downloaded range reaches the archived newest", function()
@@ -243,7 +243,7 @@ test("LoadOlder asks for older messages and the reply is archived", function()
     noMissing(GL, 250)
     GL.Chat:LoadOlder()
     eq(#W.clubRequests, requests + 1, "nothing more once at the start")
-    eq(GL.Chat:Status(), "That's the start of the server's history", "status")
+    eq(GL.Chat:Status(), "", "status")
 end)
 
 test("loginMark is the newest archived epoch before this session's reads", function()
@@ -364,7 +364,7 @@ test("reaching the start of the server's history is saved, and LoadOlder asks fo
     eq(#W.clubRequests, 0, "nothing to backfill")
     GL.Chat:LoadOlder()
     eq(#W.clubRequests, 0, "LoadOlder made no request")
-    eq(GL.Chat:Status(), "That's the start of the server's history", "status at once")
+    eq(GL.Chat:Status(), "", "status at once")
 end)
 
 test("LoadOlder walks past what the archive already has, then adds one batch of older messages", function()
@@ -394,7 +394,6 @@ test("nothing downloaded yet at Start is not the start of history: the step look
     newClub(250, 0)
     local GL = session()
     GL.Chat:Start()
-    ok(GL.Chat:Status() ~= "That's the start of the server's history", "not the start")
     eq(guildStore(GL).begin.g, nil, "begin not saved")
     W.club.downloaded[GUILD] = 100   -- the client's own first fetch lands
     W.runTimers()
@@ -497,5 +496,5 @@ test("GL:OnChatStatus is called when a walk ends, so the status line does not st
     eq(GL.Chat:Status(), "Loading older messages\226\128\166", "the guild walk runs")
     drive()
     ok(calls > before, "called when the guild walk ended")
-    eq(GL.Chat:Status(), "That's the start of the server's history", "and the status has moved on")
+    eq(GL.Chat:Status(), "", "and the status has moved on")
 end)

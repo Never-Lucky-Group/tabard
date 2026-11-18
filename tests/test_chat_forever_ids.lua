@@ -115,7 +115,7 @@ test("a backfill ends at the stream's start when the game never says it is the b
     ok(#W.clubRequests <= 6, "stopped soon after the start (" .. #W.clubRequests .. " requests)")
     eq(store.begin.g, true, "start of history recorded")
     ok(store.caughtUp.g ~= nil, "caught up")
-    eq(GL.Chat:Status(), "That's the start of the server's history", "status says so")
+    eq(GL.Chat:Status(), "", "status says so")
 end)
 
 test("load older stops asking once the stream's start is found that way", function()
@@ -128,5 +128,5 @@ test("load older stops asking once the stream's start is found that way", functi
     GL.Chat:LoadOlder()
     drive()
     eq(#W.clubRequests, 0, "no requests past the start")
-    eq(GL.Chat:Status(), "That's the start of the server's history", "status")
+    eq(GL.Chat:Status(), "", "status")
 end)

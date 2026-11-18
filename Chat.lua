@@ -642,17 +642,13 @@ function Chat:LoadOlder()
     end
 end
 
+-- The Chat page's status line: says something only while older messages are being fetched (or the archive is
+-- off). Reaching the start of the server's history is not announced; the line just goes quiet.
 function Chat:Status()
     if self.disabled or not self:Eligible() then return "Guild chat archive is off" end
-    local any, allAtStart = false, true
     for _, ch in ipairs(CHANNELS) do
-        if self.streams[ch] then
-            any = true
-            if self.pending[ch] or self.queued[ch] then return "Loading older messages\226\128\166" end
-            if not ((self.store and self.store.begin[ch]) or self.atStart[ch]) then allAtStart = false end
-        end
+        if self.streams[ch] and (self.pending[ch] or self.queued[ch]) then return "Loading older messages\226\128\166" end
     end
-    if any and allAtStart then return "That's the start of the server's history" end
     return ""
 end
 
