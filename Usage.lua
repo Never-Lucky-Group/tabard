@@ -23,7 +23,7 @@ local WIRE_LIMIT = 230   -- the usage part of a "U" message; Sync messages stop 
 
 -- Pages of the window: key, wire code, name in the readable line.
 local PAGES = {
-    { "overview", "ov", "Overview" }, { "todo", "td", "To-do" }, { "log", "lg", "Log" }, { "members", "mb", "Members" },
+    { "overview", "ov", "Overview" }, { "todo", "td", "To-do" }, { "log", "lg", "Log" }, { "chat", "ch", "Chat" }, { "members", "mb", "Members" },
     { "play", "pl", "Play" }, { "former", "fm", "Former" }, { "bans", "bn", "Bans" }, { "tools", "tl", "Tools" },
     { "export", "ex", "Export" }, { "settings", "st", "Settings" },
 }

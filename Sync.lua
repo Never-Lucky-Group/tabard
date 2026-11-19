@@ -395,18 +395,22 @@ function Sync:Since(guild)
     return self.since
 end
 
+-- The version as it goes on the wire. The NL- label keeps upstream copies quiet: they cannot parse it, so they
+-- never raise a notice about our builds (see noteVersion).
+local function wireVersion() return "NL-" .. tostring(GL.version) end
+
 -- Hello: announces this user and asks everyone for the records newer than our last run (`ask` asks for all).
 function Sync:Hello(ask, target)
     if not enabled() then return end
     local guild = GL:Guild()
     if not guild then return end
     local since = ask and 0 or self:Since(guild)
-    self:Push(table.concat({ "H", GL.version, ask and 1 or 0, since, PROTO }, SEP), target and "WHISPER" or "GUILD", target)
+    self:Push(table.concat({ "H", wireVersion(), ask and 1 or 0, since, PROTO }, SEP), target and "WHISPER" or "GUILD", target)
     -- what this copy is used for travels with the hello (counts and switches only; see Usage.lua)
     if GL.Usage and GL.Usage:Sharing() then
         local ok, wire = pcall(GL.Usage.Wire, GL.Usage)
         if ok and type(wire) == "string" and wire ~= "" then
-            self:Push(table.concat({ "U", clean(GL.version), clean(wire) }, SEP), target and "WHISPER" or "GUILD", target)
+            self:Push(table.concat({ "U", clean(wireVersion()), clean(wire) }, SEP), target and "WHISPER" or "GUILD", target)
         end
     end
 end
@@ -529,16 +533,19 @@ local function apply(guild, fields, sender)
 end
 
 -- A peer running a newer release means a newer one is on the fork's GitHub (the client cannot update addons itself):
--- one chat line per session, and the Overview shows it until then.
+-- one chat line per session, and the Overview shows it until then. Only fork peers label their version with NL-;
+-- upstream copies cannot parse that label, so they never raise this notice, and their versions are not compared.
 local announcedVersion
 local function noteVersion(version, sender)
-    local theirs, ours = GL:VersionNumber(version), GL:VersionNumber(GL.version)
+    local plain = string.match(version, "^NL%-(.*)$")
+    if not plain then return end
+    local theirs, ours = GL:VersionNumber(plain), GL:VersionNumber(GL.version)
     if not (theirs and ours) or ours == 0 or theirs <= ours then return end
     if GL.newerVersion and (GL:VersionNumber(GL.newerVersion) or 0) >= theirs then return end
-    GL.newerVersion = version
-    if announcedVersion ~= version then
-        announcedVersion = version
-        GL:Print(string.format("Tabard %s is available (you have %s; %s runs the new one). Get it from https://github.com/Never-Lucky-Group/tabard", version, GL.version, sender))
+    GL.newerVersion = plain
+    if announcedVersion ~= plain then
+        announcedVersion = plain
+        GL:Print(string.format("Tabard %s is available (you have %s; %s runs the new one). Get it from https://github.com/Never-Lucky-Group/tabard", plain, GL.version, sender))
     end
 end
 
