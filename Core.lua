@@ -15,7 +15,7 @@ local function tocVersion()
 end
 GL.version = tocVersion() or "0.0.0"
 -- One line for the "updated to" message at the first login after an update (an addon cannot read CHANGELOG.md).
-GL.whatsNew = "a searchable guild chat archive (officers and up) on the new Chat tab, and the fork's version no longer prompts other guild members to update"
+GL.whatsNew = "a Chat tab for reading guild and officer chat (officers and up), filtered by player, channel and date, and the fork's version no longer prompts other guild members to update"
 
 -- "1.2.10" -> 1002010, so versions compare as numbers; nil when the text is not a version.
 function GL:VersionNumber(text)
@@ -83,8 +83,7 @@ local DEFAULT_SETTINGS = {
     anniversaries = true,    -- mention join anniversaries and birthdays at login
     inviteBar = true,        -- offer the secure Invite button when someone outside the guild whispers you
     loginReport = true,      -- list who joined, left and changed rank while you were away, at login
-    chatArchive = true,      -- keep a copy of guild and officer chat on this machine (officers and up; see Chat.lua)
-    chatKeepDays = 0,        -- drop archived chat older than this many days (0 = keep all)
+    chatArchive = true,      -- the Chat tab, for officers and up (Chat.lua); nothing about chat is saved
     minimap = { shown = true, angle = 220 },
     windowPoint = nil,       -- saved window position { point, x, y }
 }
@@ -102,7 +101,7 @@ local function copyDefaults(target, defaults)
 end
 
 -- Saved data ---------------------------------------------------------------------------------
--- TabardDB = { version, settings, guilds = { [key] = guild }, chat = { [key] = { days, newest, caughtUp, begin } } }
+-- TabardDB = { version, settings, guilds = { [key] = guild } }   (guild chat is never saved; see Chat.lua)
 -- (chat is the guild chat archive, kept beside the guild records so GL:Backup never copies it; see Chat.lua)
 -- guild = {
 --   name, realm, created (first scan), scans (count), seeded, lastScan,

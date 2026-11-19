@@ -1628,10 +1628,10 @@ local function buildLogPage()
 end
 
 -- Chat page -----------------------------------------------------------------------------------------------
--- The guild and officer chat archive (Chat.lua), for officers and up. Oldest at the top, newest at the bottom
--- like the chat window itself. A query reads the archive, so it runs only when a filter changed or the page is
--- entered (dirty); messages archived while the page is open are read from the last one shown and added at the
--- end, and a ledger change only draws the visible rows again. Typing is debounced.
+-- Guild and officer chat as the game holds it this session (Chat.lua), for officers and up. Oldest at the top,
+-- newest at the bottom like the chat window itself. The messages are read again only when a filter changed, the
+-- page is entered, or Chat.lua says new ones arrived (dirty); a ledger change only draws the visible rows again.
+-- Typing in the Player box is debounced. "Load all history" fetches everything back to the start of the stream.
 -- Everything lives in one table: UI.lua's main chunk is close to Lua 5.1's limit of 200 locals.
 local chatUI = {
     RANGES = {
@@ -1641,17 +1641,14 @@ local chatUI = {
         { key = "all", label = "All" },
     },
     RANGE_LABELS = {},
-    OLDER_EVERY = 3,      -- seconds between "load older" requests from scrolling to the top
     DEBOUNCE = 0.3,
-    state = { search = "", player = "", guild = true, officer = true, alts = true, range = "30" },
-    dirty = true,         -- the next refresh reads the archive again for the current filters
-    newFrom = nil,        -- the oldest epoch archived since the last refresh, while nothing else changed
+    state = { player = "", guild = true, officer = true, alts = true, range = "all" },
+    dirty = true,         -- the next refresh reads the messages again for the current filters
     redraw = false,       -- the ledger changed: the shown rows look up their members again
     signature = nil,      -- the filters `messages` was read with
-    messages = nil,       -- the archived messages for those filters, oldest first
-    rows = nil,           -- the list rows built from `messages`, and how the build ended (lastDay, marked, mark)
+    messages = nil,       -- the messages for those filters, oldest first
+    rows = nil,           -- the list rows built from `messages` (and lastDay, the day of the last one)
     guild = nil,          -- the ledger as of the last refresh, for looking up the member behind a drawn row
-    olderAt = -100,       -- GetTime() of the last LoadOlder
     debounce = 0,
 }
 for _, range in ipairs(chatUI.RANGES) do chatUI.RANGE_LABELS[range.key] = range.label end
@@ -1703,67 +1700,38 @@ end
 
 function chatUI.filtersSet()
     local state = chatUI.state
-    return state.search ~= "" or strtrim(state.player or "") ~= "" or not state.guild or not state.officer or state.range ~= "all"
+    return strtrim(state.player or "") ~= "" or not state.guild or not state.officer or state.range ~= "all"
 end
 
--- Brings chatUI.messages up to date. Returns "full" when it was read again (the rows must be built again), a list
--- of messages added at its end, or nil when nothing changed.
+-- Brings chatUI.messages up to date; true when it was read again (the rows must be built again).
 function chatUI.update(guild)
     local state = chatUI.state
     local authors = chatUI.authors(guild)
     local names = {}
     if authors then for name in pairs(authors) do names[#names + 1] = name end table.sort(names) end
     local since = chatUI.since()
-    local key = GL:GuildKey()
     -- "today" and the rolling ranges move with the clock, so the day is part of the signature
-    local signature = table.concat({ tostring(key), state.search, table.concat(names, ","), tostring(state.guild), tostring(state.officer),
+    local signature = table.concat({ tostring(GL:GuildKey()), table.concat(names, ","), tostring(state.guild), tostring(state.officer),
         state.range, tostring(since and date("%Y%m%d", since)) }, "\031")
+    if not chatUI.dirty and chatUI.signature == signature and chatUI.messages then return false end
     local channels = {}
     if state.guild then channels.g = true end
     if state.officer then channels.o = true end
-    local store = GL.Chat:Store(key)
-    local filter = { text = state.search ~= "" and state.search or nil, authors = authors, channels = channels, since = since }
-    local messages = chatUI.messages
-    local last = messages and messages[#messages]
-    local from = chatUI.newFrom
-    chatUI.newFrom = nil
-    -- A full read on a filter change or page entry, and when older messages were filled in (a backfill or
-    -- "load older") rather than new ones added at the end.
-    if chatUI.dirty or chatUI.signature ~= signature or not messages or (from and last and from <= last.epoch) then
-        chatUI.messages = GL.Chat:Query(store, filter)
-        chatUI.signature, chatUI.dirty = signature, false
-        return "full"
-    end
-    if not from then return nil end
-    -- Everything new is at or after `from`, so read from its second on and keep what comes after the last shown.
-    local fromSecond = math.floor(from / 1e6)
-    filter.since = since and math.max(since, fromSecond) or fromSecond
-    local fresh = {}
-    for _, rec in ipairs(GL.Chat:Query(store, filter)) do
-        if not last or rec.epoch > last.epoch or (rec.epoch == last.epoch and (rec.pos or 0) > (last.pos or 0)) then
-            fresh[#fresh + 1] = rec
-            messages[#messages + 1] = rec
-        end
-    end
-    return #fresh > 0 and fresh or nil
+    chatUI.messages = GL.Chat:Messages({ authors = authors, channels = channels, since = since })
+    chatUI.signature, chatUI.dirty = signature, false
+    return true
 end
 
--- Adds rows for `messages` to chatUI.rows and returns the added ones: a day separator when the day changes, and
--- one divider before the first message newer than the newest one archived at login. The member behind a name is
+-- Adds rows for `messages` to chatUI.rows, with a day separator when the day changes. The member behind a name is
 -- looked up when the row is drawn, so a ledger change needs no rebuild.
 function chatUI.addRows(messages)
     local rows, added = chatUI.rows, {}
-    local mark = chatUI.mark
     for _, rec in ipairs(messages) do
         local seconds = math.floor(rec.epoch / 1e6)
         local day = date("%Y%m%d", seconds)
         if day ~= chatUI.lastDay then
             chatUI.lastDay = day
             added[#added + 1] = { kind = "day", text = date("%a %d %b %Y", seconds) }
-        end
-        if mark and not chatUI.marked and rec.epoch > mark then
-            chatUI.marked = true
-            added[#added + 1] = { kind = "divider", text = "New since you logged in" }
         end
         added[#added + 1] = { kind = "msg", epoch = rec.epoch, seconds = seconds, ch = rec.ch, author = rec.author, text = rec.text }
     end
@@ -1805,14 +1773,30 @@ function chatUI.debounced(page)
     C_Timer.After(chatUI.DEBOUNCE, function() if token == chatUI.debounce then chatUI.changed(page) end end)
 end
 
+-- "Load all history" follows the fetching: "Loading…" while any channel is fetched, "All history loaded" once
+-- every channel reached its start this session.
+function chatUI.button(page)
+    local button = page.loadAll
+    if not button then return end
+    if GL.Chat:AllLoaded() then button:SetText("All history loaded") button:Disable()
+    elseif GL.Chat:Loading() then button:SetText("Loading\226\128\166") button:Disable()
+    else button:SetText("Load all history") button:Enable() end
+end
+
 function chatUI.build()
     local state = chatUI.state
     local page = createPage("chat")
-    page.search = createSearchBox(page, function(text) state.search = text chatUI.debounced(page) end)
-    page.search:SetPoint("TOPLEFT", page, "TOPLEFT", 72, -7)
+    -- Fetches the whole history this session; nothing is fetched beyond the last 250 messages without it.
+    page.loadAll = makeButton(page, "Load all history", 150, function()
+        if GL.Chat:Eligible() then GL.Chat:LoadAll() end
+        chatUI.button(page)
+        setText(page.status, GL.Chat:Status() or "")
+    end)
+    page.loadAll:SetPoint("TOPLEFT", page, "TOPLEFT", 72, -6)
+    explain(page.loadAll, "Fetches all of guild and officer chat back to the start, for this session only: chat is never saved, so after a /reload it starts again from the last 250 messages.")
 
     local playerLabel = page:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    playerLabel:SetPoint("LEFT", page.search, "RIGHT", 10, 0)
+    playerLabel:SetPoint("LEFT", page.loadAll, "RIGHT", 10, 0)
     playerLabel:SetText("Player")
     playerLabel:SetTextColor(0.62, 0.62, 0.62)
     page.player = makeEditBox(page, 120)
@@ -1930,80 +1914,49 @@ function chatUI.build()
             if member then openCard(member) end
         end)
 
-    -- Scrolled to the top with every date shown: ask the game for older messages, at most every few seconds.
-    local box = page.list.scrollBox
-    if box and box.RegisterCallback and BaseScrollBoxEvents and BaseScrollBoxEvents.OnScroll then
-        pcall(box.RegisterCallback, box, BaseScrollBoxEvents.OnScroll, function(_, percent)
-            if page.settling or state.range ~= "all" then return end
-            if type(percent) ~= "number" or percent > 0 then return end
-            local now = GetTime()
-            if now - chatUI.olderAt < chatUI.OLDER_EVERY then return end
-            chatUI.olderAt = now
-            if GL.Chat:Eligible() then GL.Chat:LoadOlder() page.status:SetText(GL.Chat:Status()) end
-        end, page)
-    end
-
     page.refresh = function()
         local guild = GL:Guild()
         chatUI.guild = guild   -- for the row drawing, which happens while scrolling too
         if not (guild and GL.Chat:Eligible()) then
             page.list.SetRows({})
             chatUI.rows, chatUI.dirty = nil, true
-            showEmpty(page, "The guild chat archive is for officers and up, and is switched off in Settings or not available for your rank.")
+            showEmpty(page, "The Chat tab is for officers and up, and is switched off in Settings or not available for your rank.")
             setText(page.count, "")
             setText(page.status, "")
             return
         end
-        local change = chatUI.update(guild)
+        local full = chatUI.update(guild)
         local messages = chatUI.messages
         local stick = page.scrollEnd or chatUI.atBottom(page.list)
         page.scrollEnd = nil
-        local mark = GL.Chat.loginMark
-        if change == "full" or not chatUI.rows or chatUI.mark ~= mark then
-            chatUI.rows, chatUI.lastDay, chatUI.marked, chatUI.mark = {}, nil, false, mark
+        if full or not chatUI.rows then
+            chatUI.rows, chatUI.lastDay = {}, nil
             chatUI.addRows(messages)
             chatUI.settle(page)
             page.list.SetRows(chatUI.rows)
-        else
-            if change then
-                local added = chatUI.addRows(change)
-                chatUI.settle(page)
-                if not (page.list.AppendRows and page.list.AppendRows(added)) then page.list.SetRows(chatUI.rows) end
-            end
-            if chatUI.redraw and page.list.Redraw then page.list.Redraw() end
+        elseif chatUI.redraw and page.list.Redraw then
+            page.list.Redraw()
         end
         chatUI.redraw = false
         if stick then chatUI.scrollToEnd(page) end
-        if #messages == 0 then
-            local store = GL.Chat:Store(GL:GuildKey())
-            if store and next(store.days) ~= nil and chatUI.filtersSet() then
-                showEmpty(page, "No messages match.")
-            else
-                showEmpty(page, "No guild chat archived yet. Messages are saved as they arrive and from the game's recent history.")
-            end
-        else
+        if #messages > 0 then
             showEmpty(page, nil)
+        elseif chatUI.filtersSet() then
+            showEmpty(page, "No messages match.")
+        else
+            showEmpty(page, GL.Chat:Loading() and "Fetching guild chat\226\128\166" or "No guild chat yet.")
         end
+        chatUI.button(page)
         page.filter:SetLabel(chatUI.RANGE_LABELS[state.range] or "Filter")
         setText(page.count, plural(#messages, "message"))
         setText(page.status, GL.Chat:Status() or "")
     end
 end
 
--- Chat.lua calls this (at most once a second) after it archives messages, with the oldest epoch among them.
-function GL:OnChatChanged(from)
-    if type(from) == "number" and not chatUI.dirty then
-        if not chatUI.newFrom or from < chatUI.newFrom then chatUI.newFrom = from end
-    else
-        chatUI.dirty = true
-    end
+-- Chat.lua calls this (at most once a second) when messages arrived or a fetch started or ended.
+function GL:OnChatChanged()
+    chatUI.dirty = true
     if frame and frame:IsShown() and currentPage == "chat" then GL:RefreshWindow() end
-end
-
--- Chat.lua calls this when a backfill or a "load older" walk ends: only the status line can have changed.
-function GL:OnChatStatus()
-    local page = pages.chat
-    if page and page.status and frame and frame:IsShown() and currentPage == "chat" then setText(page.status, GL.Chat:Status() or "") end
 end
 
 -- Members page --------------------------------------------------------------------------------------------
@@ -3732,7 +3685,7 @@ local function buildSettingsPage()
         { key = "hints", label = "Show the main's name, or the nickname, after names in guild chat", default = true },
         { key = "requests", label = "Accept requests whispered to you (!main, !bday, !loa); they land on the To-do tab", default = true },
         { key = "inviteBar", label = "Offer an Invite button when someone outside the guild whispers you (your click sends it)", default = true },
-        { key = "chatArchive", label = "Keep a guild chat archive (officers and up)", default = true },
+        { key = "chatArchive", label = "Show guild chat on the Chat tab (officers and up)", default = true },
         { key = "raidTracking", label = "Track raid attendance, bench and loot while you are in a raid group", default = true },
     }
     local behaviourHeight = 34 + 16 * 30 + 6
@@ -3847,10 +3800,9 @@ local function buildSettingsPage()
         { key = "trialDays", label = "days in the trial rank before a review is due", default = 14 },
         { key = "strikeDays", label = "days a strike counts (0 = forever)", default = 90 },
         { key = "keepEventDays", label = "days of history to keep; older events are tidied away (0 = keep all)", default = 365 },
-        { key = "chatKeepDays", label = "days of guild chat to keep (0 = keep all)", default = 0 },
     }
     local thresholdsTop = -PAD - behaviourHeight - GAP
-    local thresholdsHeight = 34 + 9 * 26 + 6
+    local thresholdsHeight = 34 + 8 * 26 + 6
     page.thresholdBox = section(content, "Thresholds", rightX, thresholdsTop, rightWidth, thresholdsHeight)
     page.numbers = {}
     y = -2
