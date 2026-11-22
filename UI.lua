@@ -1631,7 +1631,9 @@ end
 -- Guild and officer chat as the game holds it this session (Chat.lua), for officers and up. Oldest at the top,
 -- newest at the bottom like the chat window itself. The messages are read again only when a filter changed, the
 -- page is entered, or Chat.lua says new ones arrived (dirty); a ledger change only draws the visible rows again.
--- Typing in the Player box is debounced. "Load all history" fetches everything back to the start of the stream.
+-- Typing in the Player box is debounced. "Load all history" fetches everything back to the start of the stream and
+-- "Load 100 more" fetches the next 100 older messages of each channel the filter shows. An "Unread messages" line
+-- marks the first message that arrived after the player's last visit (guild.visitSince, set by Summary.lua).
 -- Everything lives in one table: UI.lua's main chunk is close to Lua 5.1's limit of 200 locals.
 local chatUI = {
     RANGES = {
@@ -1703,6 +1705,14 @@ function chatUI.filtersSet()
     return strtrim(state.player or "") ~= "" or not state.guild or not state.officer or state.range ~= "all"
 end
 
+-- The channels the filter shows, as a set: { g = true, o = true }, empty when both are off.
+function chatUI.shown()
+    local channels = {}
+    if chatUI.state.guild then channels.g = true end
+    if chatUI.state.officer then channels.o = true end
+    return channels
+end
+
 -- Brings chatUI.messages up to date; true when it was read again (the rows must be built again).
 function chatUI.update(guild)
     local state = chatUI.state
@@ -1712,12 +1722,9 @@ function chatUI.update(guild)
     local since = chatUI.since()
     -- "today" and the rolling ranges move with the clock, so the day is part of the signature
     local signature = table.concat({ tostring(GL:GuildKey()), table.concat(names, ","), tostring(state.guild), tostring(state.officer),
-        state.range, tostring(since and date("%Y%m%d", since)) }, "\031")
+        state.range, tostring(since and date("%Y%m%d", since)), tostring(guild and guild.visitSince) }, "\031")
     if not chatUI.dirty and chatUI.signature == signature and chatUI.messages then return false end
-    local channels = {}
-    if state.guild then channels.g = true end
-    if state.officer then channels.o = true end
-    chatUI.messages = GL.Chat:Messages({ authors = authors, channels = channels, since = since })
+    chatUI.messages = GL.Chat:Messages({ authors = authors, channels = chatUI.shown(), since = since })
     chatUI.signature, chatUI.dirty = signature, false
     return true
 end
@@ -1726,13 +1733,16 @@ end
 -- looked up when the row is drawn, so a ledger change needs no rebuild.
 function chatUI.addRows(messages)
     local rows, added = chatUI.rows, {}
-    for _, rec in ipairs(messages) do
+    -- the first message after the last visit gets an "Unread messages" line, after its day heading
+    local unread = GL.Chat:FirstUnread(messages, chatUI.guild and chatUI.guild.visitSince, chatUI.shown())
+    for index, rec in ipairs(messages) do
         local seconds = math.floor(rec.epoch / 1e6)
         local day = date("%Y%m%d", seconds)
         if day ~= chatUI.lastDay then
             chatUI.lastDay = day
             added[#added + 1] = { kind = "day", text = date("%a %d %b %Y", seconds) }
         end
+        if index == unread then added[#added + 1] = { kind = "divider", text = "Unread messages" } end
         added[#added + 1] = { kind = "msg", epoch = rec.epoch, seconds = seconds, ch = rec.ch, author = rec.author, text = rec.text }
     end
     for _, row in ipairs(added) do rows[#rows + 1] = row end
@@ -1773,14 +1783,24 @@ function chatUI.debounced(page)
     C_Timer.After(chatUI.DEBOUNCE, function() if token == chatUI.debounce then chatUI.changed(page) end end)
 end
 
--- "Load all history" follows the fetching: "Loading…" while any channel is fetched, "All history loaded" once
--- every channel reached its start this session.
+-- Both load buttons follow the fetching: "Loading…" while any channel is fetched. "Load all history" then reads
+-- "All history loaded" once every channel reached its start this session; "Load 100 more" is off when the filter
+-- shows no channel or the channels it shows are all loaded.
 function chatUI.button(page)
-    local button = page.loadAll
+    local button, more = page.loadAll, page.loadMore
     if not button then return end
-    if GL.Chat:AllLoaded() then button:SetText("All history loaded") button:Disable()
-    elseif GL.Chat:Loading() then button:SetText("Loading\226\128\166") button:Disable()
+    local loading = GL.Chat:Loading()
+    if loading then
+        button:SetText("Loading\226\128\166") button:Disable()
+    elseif GL.Chat:AllLoaded() then button:SetText("All history loaded") button:Disable()
     else button:SetText("Load all history") button:Enable() end
+    if not more then return end
+    local shown = chatUI.shown()
+    if loading then more:SetText("Loading\226\128\166") more:Disable()
+    else
+        more:SetText("Load 100 more")
+        if next(shown) == nil or GL.Chat:AllLoaded(shown) then more:Disable() else more:Enable() end
+    end
 end
 
 function chatUI.build()
@@ -1795,8 +1815,18 @@ function chatUI.build()
     page.loadAll:SetPoint("TOPLEFT", page, "TOPLEFT", 72, -6)
     explain(page.loadAll, "Fetches all of guild and officer chat back to the start, for this session only: chat is never saved, so after a /reload it starts again from the last 250 messages.")
 
+    -- Fetches the next 100 older messages of the channels the filter shows. Toolbar: Load all ends at x=222, this one
+    -- at x=338, the Player label and box (120 wide) at about x=511, well left of the count and filter (from about x=600).
+    page.loadMore = makeButton(page, "Load 100 more", 110, function()
+        if GL.Chat:Eligible() then GL.Chat:LoadMore(chatUI.shown()) end
+        chatUI.button(page)
+        setText(page.status, GL.Chat:Status() or "")
+    end)
+    page.loadMore:SetPoint("LEFT", page.loadAll, "RIGHT", 6, 0)
+    explain(page.loadMore, "Fetches the next 100 older messages of each channel the filter shows, for this session only.")
+
     local playerLabel = page:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    playerLabel:SetPoint("LEFT", page.loadAll, "RIGHT", 10, 0)
+    playerLabel:SetPoint("LEFT", page.loadMore, "RIGHT", 10, 0)
     playerLabel:SetText("Player")
     playerLabel:SetTextColor(0.62, 0.62, 0.62)
     page.player = makeEditBox(page, 120)

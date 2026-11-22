@@ -4,7 +4,8 @@
 -- protected code (|Kw3392|k) that the game draws as the words in the session that received it and as "Unknown"
 -- after a /reload, so a saved copy is unreadable and words cannot be searched. The client keeps every message it
 -- downloaded this session, live ones included, and the Chat tab reads them straight from it. At login each channel
--- is topped up to about the last 250 messages; "Load all history" walks back to the start of the stream.
+-- is topped up to about the last 250 messages; "Load 100 more" fetches the next 100 older ones, and "Load all
+-- history" walks back to the start of the stream.
 
 local ADDON_NAME, GL = ...
 
@@ -19,6 +20,7 @@ local SETTLE = 2          -- seconds after a history event before the next reque
 local WATCHDOG = 15       -- seconds without a history event before a request is repeated
 local BATCH = 100
 local RECENT = 250        -- messages per channel fetched at login
+local MORE_REQUESTS = 5   -- per "Load 100 more" press, a safety stop (a press needs one request, a few if the game is slow)
 local MAX_REQUESTS = 500  -- per walk, a safety stop (about 50,000 messages)
 local STALLS = 3          -- requests in a row that bring nothing older: the start of the stream (see step)
 local REQUIRED = { "GetGuildClubId", "GetStreams", "GetMessageRanges", "GetMessagesInRange", "GetMessageInfo",
@@ -28,7 +30,8 @@ Chat.disabled = false
 Chat.started = false
 Chat.tried = false     -- Start has run at least once (PLAYER_LOGIN + 5 s); a roster scan may start it after that
 Chat.streams = {}      -- { g = streamId, o = streamId }
-Chat.walking = {}      -- channels being fetched: "recent" (the login top-up) or "all" (Load all history)
+Chat.walking = {}      -- channels being fetched: "recent" (the login top-up), "more" (Load 100 more) or "all" (Load all history)
+Chat.target = {}       -- the downloaded count a "more" walk stops at, per channel
 Chat.pending = {}      -- channels with a request waiting for its history event
 Chat.queued = {}       -- channels with a next step already scheduled
 Chat.token = {}        -- bumped by every request and every history event; a watchdog only acts if it is unchanged
@@ -198,7 +201,7 @@ function Chat:Request(ch, oldest)
 end
 
 -- One step of a channel's walk: stop at the start of the stream (or, for the login top-up, once 250 messages are
--- downloaded), otherwise ask for 100 more.
+-- downloaded; for Load 100 more, once 100 more are), otherwise ask for 100 more.
 local function step(self, ch)
     self.queued[ch] = nil
     local mode = self.walking[ch]
@@ -228,6 +231,10 @@ local function step(self, ch)
         self.walking[ch] = nil
         return
     end
+    if mode == "more" and #infosIn(self, ch, main) >= (self.target[ch] or 0) then
+        self.walking[ch] = nil
+        return
+    end
     local ok, begin = self:Call("IsBeginningOfStream", self.clubId, self.streams[ch], oldest)
     if self.disabled then return end
     -- WoW Forever answers false even at the guild's first message, so a request that brings nothing older, a few
@@ -242,7 +249,7 @@ local function step(self, ch)
         self.walking[ch], self.atStart[ch] = nil, true
         return
     end
-    if self.requests[ch] >= MAX_REQUESTS then
+    if self.requests[ch] >= (mode == "more" and MORE_REQUESTS or MAX_REQUESTS) then
         self.walking[ch] = nil
         return
     end
@@ -259,6 +266,7 @@ end
 
 function Chat:Walk(ch, mode)
     self.walking[ch], self.requests[ch] = mode, 0
+    self.lastAsked[ch], self.stalls[ch] = nil, 0   -- stalls are counted within one walk
     if not self.pending[ch] and not self.queued[ch] then self:Step(ch) end
 end
 
@@ -296,14 +304,30 @@ end
 
 -- The "Load all history" button: walk every channel back to the start of its stream.
 function Chat:LoadAll()
-    if self.disabled or not self.started or not self:Eligible() then return end
+    if self.disabled or not self.started or not self:Eligible() or self:Loading() then return end
     for _, ch in ipairs(CHANNELS) do
         if self.streams[ch] and not self.atStart[ch] and self.walking[ch] ~= "all" then self:Walk(ch, "all") end
     end
     self:Changed()
 end
 
--- Any channel being fetched (the login top-up or Load all history).
+-- The "Load 100 more" button: fetch the next 100 older messages of each given channel (a set like { g = true };
+-- nil means both). Ignored while anything is loading.
+function Chat:LoadMore(channels)
+    if self.disabled or not self.started or not self:Eligible() or self:Loading() then return end
+    for _, ch in ipairs(CHANNELS) do
+        if self.streams[ch] and (not channels or channels[ch]) and not self.atStart[ch] then
+            local _, main = self:Ranges(ch)
+            if self.disabled then return end
+            local have = main and #infosIn(self, ch, main) or 0
+            self.target[ch] = have + BATCH
+            self:Walk(ch, "more")
+        end
+    end
+    self:Changed()
+end
+
+-- Any channel being fetched (the login top-up, Load 100 more or Load all history).
 function Chat:Loading()
     for _, ch in ipairs(CHANNELS) do
         if self.streams[ch] and self.walking[ch] then return true end
@@ -311,13 +335,35 @@ function Chat:Loading()
     return false
 end
 
--- Every channel's whole history is downloaded this session.
-function Chat:AllLoaded()
+-- Every channel's (in the given set, nil meaning both) whole history is downloaded this session.
+function Chat:AllLoaded(channels)
     if not self.started then return false end
     for _, ch in ipairs(CHANNELS) do
-        if self.streams[ch] and not self.atStart[ch] then return false end
+        if self.streams[ch] and (not channels or channels[ch]) and not self.atStart[ch] then return false end
     end
     return true
+end
+
+-- Where the "unread" line goes in a list of messages (oldest first, epoch in microseconds): the index of the first
+-- message newer than `since` (Unix seconds), or nil when there is no marker, nothing is newer, that message is the
+-- first one shown (a line above everything would say nothing), or it may not be loaded: every channel in `channels`
+-- (a set, nil meaning both) that has a stream must either be downloaded to its start or reach back to `since`,
+-- otherwise older unread messages of that channel are missing and the line would sit in the wrong place.
+function Chat:FirstUnread(messages, since, channels)
+    if type(since) ~= "number" then return nil end
+    if self.started then
+        for _, ch in ipairs(CHANNELS) do
+            if self.streams[ch] and (not channels or channels[ch]) and not self.atStart[ch] then
+                local _, main = self:Ranges(ch)
+                if self.disabled then return nil end
+                if not (main and main.oldestMessageId.epoch / 1e6 <= since) then return nil end
+            end
+        end
+    end
+    for i, m in ipairs(messages) do
+        if m.epoch / 1e6 > since then return i > 1 and i or nil end
+    end
+    return nil
 end
 
 -- The Chat page's status line: says something only while older messages are being fetched (or it is off).
