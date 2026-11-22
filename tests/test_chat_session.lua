@@ -208,6 +208,25 @@ test("FirstUnread hides the line while a shown channel's first unread message is
     ok(msgs[idx - 1].epoch / 1e6 <= since, "the one before is read")
 end)
 
+test("a channel with nothing downloaded yet does not hold the line back", function()
+    -- A fresh login: guild chat is downloaded, officer chat not yet (Tabard waits up to 90 s before calling it empty).
+    newClub(1000, 1000, 300)
+    W.club.downloaded[OFFICER] = 0
+    local GL = session()
+    GL.Chat:Start()
+    local since = BASE + 650
+    local msgs = GL.Chat:Messages()
+    local idx = GL.Chat:FirstUnread(msgs, since, nil)
+    ok(idx ~= nil, "the line is drawn from guild chat")
+    eq(msgs[idx].epoch / 1e6, BASE + 651, "above the first unread guild message")
+    -- Officer chat arrives: the line is worked out again from both channels.
+    W.club.downloaded[OFFICER] = 300
+    msgs = GL.Chat:Messages()
+    idx = GL.Chat:FirstUnread(msgs, since, nil)
+    ok(idx ~= nil, "still drawn once officer chat reaches back past the marker")
+    ok(msgs[idx].epoch / 1e6 > since and msgs[idx - 1].epoch / 1e6 <= since, "between the last read and the first unread message")
+end)
+
 test("FirstUnread with only the officer channel is decided by that channel's coverage", function()
     local GL = started(1000, 100, 300)
     local only = { o = true }

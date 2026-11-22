@@ -348,7 +348,9 @@ end
 -- message newer than `since` (Unix seconds), or nil when there is no marker, nothing is newer, that message is the
 -- first one shown (a line above everything would say nothing), or it may not be loaded: every channel in `channels`
 -- (a set, nil meaning both) that has a stream must either be downloaded to its start or reach back to `since`,
--- otherwise older unread messages of that channel are missing and the line would sit in the wrong place.
+-- otherwise older unread messages of that channel are missing and the line would sit in the wrong place. A channel
+-- with nothing downloaded yet (right after a fresh login the game may not have fetched it) has no loaded messages
+-- the line could be wrong about, so it does not hold the line back; once its messages arrive it counts like the rest.
 function Chat:FirstUnread(messages, since, channels)
     if type(since) ~= "number" then return nil end
     if self.started then
@@ -356,7 +358,7 @@ function Chat:FirstUnread(messages, since, channels)
             if self.streams[ch] and (not channels or channels[ch]) and not self.atStart[ch] then
                 local _, main = self:Ranges(ch)
                 if self.disabled then return nil end
-                if not (main and main.oldestMessageId.epoch / 1e6 <= since) then return nil end
+                if main and not (main.oldestMessageId.epoch / 1e6 <= since) then return nil end
             end
         end
     end

@@ -15,7 +15,7 @@ local function tocVersion()
 end
 GL.version = tocVersion() or "0.0.0"
 -- One line for the "updated to" message at the first login after an update (an addon cannot read CHANGELOG.md).
-GL.whatsNew = "guild records split by the realm rename on WoW Forever are one ledger again (so \"since your last visit\" and the Chat tab's unread line work), and the login report waits for everyone who left while you were away"
+GL.whatsNew = "the Chat tab's \"Unread messages\" line shows right after login instead of only after a /reload"
 
 -- "1.2.10" -> 1002010, so versions compare as numbers; nil when the text is not a version.
 function GL:VersionNumber(text)
