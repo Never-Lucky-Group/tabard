@@ -15,7 +15,7 @@ local function tocVersion()
 end
 GL.version = tocVersion() or "0.0.0"
 -- One line for the "updated to" message at the first login after an update (an addon cannot read CHANGELOG.md).
-GL.whatsNew = "a \"Load 100 more\" button and an \"Unread messages\" line on the Chat tab"
+GL.whatsNew = "guild records split by the realm rename on WoW Forever are one ledger again (so \"since your last visit\" and the Chat tab's unread line work), and the login report waits for everyone who left while you were away"
 
 -- "1.2.10" -> 1002010, so versions compare as numbers; nil when the text is not a version.
 function GL:VersionNumber(text)
@@ -81,7 +81,6 @@ local DEFAULT_SETTINGS = {
     mainTags = true,         -- "(main)" / "(alt of X)" after names on event lines
     firstWeek = true,        -- track new members' first week: time online, whether anyone talked to them
     anniversaries = true,    -- mention join anniversaries and birthdays at login
-    inviteBar = true,        -- offer the secure Invite button when someone outside the guild whispers you
     loginReport = true,      -- list who joined, left and changed rank while you were away, at login
     chatArchive = true,      -- the Chat tab, for officers and up (Chat.lua); nothing about chat is saved
     minimap = { shown = true, angle = 220 },
