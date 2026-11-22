@@ -15,7 +15,7 @@ local function tocVersion()
 end
 GL.version = tocVersion() or "0.0.0"
 -- One line for the "updated to" message at the first login after an update (an addon cannot read CHANGELOG.md).
-GL.whatsNew = "a Chat tab for reading guild and officer chat (officers and up), filtered by player, channel and date, and the fork's version no longer prompts other guild members to update"
+GL.whatsNew = "a \"Load 100 more\" button and an \"Unread messages\" line on the Chat tab"
 
 -- "1.2.10" -> 1002010, so versions compare as numbers; nil when the text is not a version.
 function GL:VersionNumber(text)
